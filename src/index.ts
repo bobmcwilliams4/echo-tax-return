@@ -23,6 +23,7 @@ app.use('*', cors({
     'https://echo-op.com',
     'https://echo-lgt.com',
     'https://www.echo-lgt.com',
+    'https://echo-lgtcom.vercel.app',
     'http://localhost:3000',
     'http://localhost:3001',
   ],
@@ -54,8 +55,9 @@ app.get('/health', async (c) => {
   return c.json({
     status: 'healthy',
     service: 'echo-tax-return',
-    version: '2.1.0',
+    version: '2.3.0',
     timestamp: new Date().toISOString(),
+    features: ['multi-year', 'what-if', 'audit-risk', 'amendments', 'penalty-calc', 'notes', 'engagement-letter', 'export', 'income-projector', 'tax-calendar', 'tax-tips', 'withholding-estimator'],
     database: dbCheck ? 'connected' : 'error',
     clients: dbCheck?.cnt || 0,
   });
@@ -82,7 +84,7 @@ app.get('/pricing', async (c) => {
 app.get('/docs', (c) => {
   return c.json({
     service: 'echo-tax-return',
-    version: '2.1.0',
+    version: '2.3.0',
     preparer: 'Bobby Don McWilliams II',
     base_url: 'https://echo-tax-return.bmcii1976.workers.dev',
     auth: { header: 'X-Echo-API-Key', alt: 'Authorization: Bearer <key>' },
@@ -142,6 +144,15 @@ app.get('/docs', (c) => {
         { method: 'GET', path: '/returns/:id/estimated-payments', description: 'List estimated payments' },
         { method: 'POST', path: '/returns/:id/amendments', description: 'Create amendment (1040-X)' },
         { method: 'GET', path: '/returns/:id/amendments', description: 'List amendments' },
+        { method: 'GET', path: '/returns/tax-calendar?year=N', description: 'IRS tax deadline calendar' },
+        { method: 'GET', path: '/returns/:id/tips', description: 'Personalized tax tips' },
+        { method: 'GET', path: '/returns/:id/penalty-estimate', description: 'Underpayment penalty estimate (Form 2210)' },
+        { method: 'POST', path: '/returns/:id/notes', description: 'Add preparer note/memo' },
+        { method: 'GET', path: '/returns/:id/notes', description: 'List notes for return' },
+        { method: 'DELETE', path: '/returns/:id/notes/:noteId', description: 'Delete a note' },
+        { method: 'GET', path: '/returns/:id/engagement-letter', description: 'Generate engagement letter' },
+        { method: 'GET', path: '/returns/:id/export?format=json|csv', description: 'Export return data' },
+        { method: 'POST', path: '/returns/:id/project', description: 'Income/tax projector (multi-year forward)' },
       ],
       billing: [
         { method: 'POST', path: '/billing/checkout', description: 'Create Stripe checkout session' },
