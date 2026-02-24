@@ -1988,6 +1988,596 @@ features.get('/:id/deduction-opportunities', async (c) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// CLIENT DASHBOARD SUMMARY (comprehensive overview)
+// ═══════════════════════════════════════════════════════════════
+
+features.get('/client-summary/:clientId', async (c) => {
+  const clientId = c.req.param('clientId');
+  const client = await c.env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(clientId).first();
+  if (!client) return c.json({ error: 'Client not found' }, 404);
+
+  // Get all returns for this client
+  const returnsResult = await c.env.DB.prepare(
+    'SELECT * FROM returns WHERE client_id = ? ORDER BY tax_year DESC'
+  ).bind(clientId).all();
+  const rets = returnsResult.results as any[];
+
+  // Get all payments
+  let payments: any[] = [];
+  try {
+    const payResult = await c.env.DB.prepare(
+      'SELECT * FROM payments WHERE client_id = ? ORDER BY created_at DESC'
+    ).bind(clientId).all();
+    payments = payResult.results as any[];
+  } catch { /* table may not exist */ }
+
+  // Compute summary stats
+  const totalReturns = rets.length;
+  const filedReturns = rets.filter((r: any) => ['filed', 'accepted'].includes(r.status)).length;
+  const pendingReturns = rets.filter((r: any) => !['filed', 'accepted', 'rejected'].includes(r.status)).length;
+  const totalRefunds = rets.filter((r: any) => r.refund_or_owed > 0).reduce((s: number, r: any) => s + r.refund_or_owed, 0);
+  const totalOwed = rets.filter((r: any) => r.refund_or_owed < 0).reduce((s: number, r: any) => s + Math.abs(r.refund_or_owed), 0);
+  const avgIncome = totalReturns > 0 ? rets.reduce((s: number, r: any) => s + (r.total_income || 0), 0) / totalReturns : 0;
+  const avgTaxRate = totalReturns > 0 ? rets.reduce((s: number, r: any) => {
+    const rate = r.total_income > 0 ? (r.total_tax || 0) / r.total_income : 0;
+    return s + rate;
+  }, 0) / totalReturns * 100 : 0;
+
+  // Year-over-year trends
+  const trends = rets.map((r: any) => ({
+    year: r.tax_year,
+    income: r.total_income || 0,
+    agi: r.adjusted_gross_income || 0,
+    tax: r.total_tax || 0,
+    refund_owed: r.refund_or_owed || 0,
+    effective_rate: r.total_income > 0 ? Math.round(((r.total_tax || 0) / r.total_income) * 10000) / 100 : 0,
+    status: r.status,
+  }));
+
+  // Billing summary
+  const totalPaid = payments.filter((p: any) => p.status === 'completed').reduce((s: number, p: any) => s + (p.amount || 0), 0);
+  const pendingPayments = payments.filter((p: any) => p.status === 'pending').reduce((s: number, p: any) => s + (p.amount || 0), 0);
+
+  // Next actions
+  const nextActions: string[] = [];
+  const currentYear = new Date().getFullYear() - 1; // Tax year is previous year
+  const hasCurrentYear = rets.some((r: any) => r.tax_year === currentYear);
+  if (!hasCurrentYear) nextActions.push(`Create ${currentYear} tax return`);
+
+  const needsCalc = rets.filter((r: any) => r.status === 'intake' || r.status === 'documents');
+  if (needsCalc.length > 0) nextActions.push(`Calculate ${needsCalc.length} pending return(s)`);
+
+  const needsReview = rets.filter((r: any) => r.status === 'review');
+  if (needsReview.length > 0) nextActions.push(`Review ${needsReview.length} return(s) awaiting approval`);
+
+  const needsFiling = rets.filter((r: any) => r.status === 'calculated' || r.status === 'review');
+  if (needsFiling.length > 0) nextActions.push(`File ${needsFiling.length} completed return(s)`);
+
+  return c.json({
+    client: {
+      id: clientId,
+      name: `${(client as any).first_name} ${(client as any).last_name}`,
+      email: (client as any).email,
+      filing_status: (client as any).filing_status,
+      member_since: (client as any).created_at,
+    },
+    summary: {
+      total_returns: totalReturns,
+      filed_returns: filedReturns,
+      pending_returns: pendingReturns,
+      total_refunds: Math.round(totalRefunds * 100) / 100,
+      total_owed: Math.round(totalOwed * 100) / 100,
+      net_position: Math.round((totalRefunds - totalOwed) * 100) / 100,
+      average_income: Math.round(avgIncome),
+      average_effective_tax_rate: Math.round(avgTaxRate * 100) / 100,
+    },
+    billing: {
+      total_paid: totalPaid,
+      pending_payments: pendingPayments,
+    },
+    trends,
+    next_actions: nextActions,
+    returns: rets.map((r: any) => ({
+      id: r.id,
+      tax_year: r.tax_year,
+      status: r.status,
+      total_income: r.total_income,
+      refund_or_owed: r.refund_or_owed,
+      deduction_method: r.deduction_method,
+      updated_at: r.updated_at,
+    })),
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// RETURN TIMELINE (activity log for a specific return)
+// ═══════════════════════════════════════════════════════════════
+
+features.get('/:id/timeline', async (c) => {
+  const returnId = c.req.param('id');
+  const ret = await c.env.DB.prepare('SELECT * FROM returns WHERE id = ?').bind(returnId).first<TaxReturn>();
+  if (!ret) return c.json({ error: 'Return not found' }, 404);
+
+  // Build timeline from various sources
+  const timeline: Array<{ timestamp: string; event: string; category: string; detail?: string }> = [];
+
+  // Return creation
+  timeline.push({
+    timestamp: ret.created_at,
+    event: 'Return created',
+    category: 'lifecycle',
+    detail: `Tax year ${ret.tax_year}, Filing status: ${ret.filing_status || 'TBD'}`,
+  });
+
+  // Income items
+  try {
+    const income = await c.env.DB.prepare(
+      'SELECT category, amount, created_at FROM income_items WHERE return_id = ? ORDER BY created_at'
+    ).bind(returnId).all();
+    for (const item of income.results as any[]) {
+      timeline.push({
+        timestamp: item.created_at || ret.created_at,
+        event: `Income added: ${item.category}`,
+        category: 'income',
+        detail: `$${(item.amount || 0).toLocaleString()}`,
+      });
+    }
+  } catch { /* table may not exist */ }
+
+  // Deductions
+  try {
+    const deds = await c.env.DB.prepare(
+      'SELECT category, amount, created_at FROM deductions WHERE return_id = ? ORDER BY created_at'
+    ).bind(returnId).all();
+    for (const ded of deds.results as any[]) {
+      timeline.push({
+        timestamp: ded.created_at || ret.created_at,
+        event: `Deduction added: ${ded.category}`,
+        category: 'deduction',
+        detail: `$${(ded.amount || 0).toLocaleString()}`,
+      });
+    }
+  } catch { /* table may not exist */ }
+
+  // Documents
+  try {
+    const docs = await c.env.DB.prepare(
+      'SELECT doc_type, status, issuer_name, created_at FROM documents WHERE return_id = ? ORDER BY created_at'
+    ).bind(returnId).all();
+    for (const doc of docs.results as any[]) {
+      timeline.push({
+        timestamp: doc.created_at || ret.created_at,
+        event: `Document ${doc.status}: ${doc.doc_type}`,
+        category: 'document',
+        detail: doc.issuer_name || undefined,
+      });
+    }
+  } catch { /* table may not exist */ }
+
+  // Dependents
+  try {
+    const deps = await c.env.DB.prepare(
+      'SELECT first_name, last_name, relationship FROM dependents WHERE return_id = ?'
+    ).bind(returnId).all();
+    for (const dep of deps.results as any[]) {
+      timeline.push({
+        timestamp: ret.created_at,
+        event: `Dependent added: ${dep.first_name} ${dep.last_name}`,
+        category: 'dependent',
+        detail: dep.relationship || undefined,
+      });
+    }
+  } catch { /* table may not exist */ }
+
+  // Notes
+  try {
+    const notes = await c.env.DB.prepare(
+      'SELECT content, category, created_at FROM preparer_notes WHERE return_id = ? ORDER BY created_at'
+    ).bind(returnId).all();
+    for (const note of notes.results as any[]) {
+      timeline.push({
+        timestamp: note.created_at || ret.created_at,
+        event: `Note: ${(note.content as string).slice(0, 80)}${(note.content as string).length > 80 ? '...' : ''}`,
+        category: 'note',
+        detail: note.category as string || undefined,
+      });
+    }
+  } catch { /* table may not exist */ }
+
+  // Amendments
+  try {
+    const amends = await c.env.DB.prepare(
+      'SELECT reason, status, created_at FROM amendments WHERE return_id = ? ORDER BY created_at'
+    ).bind(returnId).all();
+    for (const a of amends.results as any[]) {
+      timeline.push({
+        timestamp: a.created_at || ret.created_at,
+        event: `Amendment ${a.status}: ${a.reason}`,
+        category: 'amendment',
+      });
+    }
+  } catch { /* table may not exist */ }
+
+  // Calculation event (if calculated)
+  if (ret.total_tax > 0 || ret.total_income > 0) {
+    timeline.push({
+      timestamp: ret.updated_at,
+      event: 'Tax calculated',
+      category: 'calculation',
+      detail: `AGI: $${(ret.adjusted_gross_income || 0).toLocaleString()}, Tax: $${(ret.total_tax || 0).toLocaleString()}, ${ret.refund_or_owed >= 0 ? 'Refund' : 'Owed'}: $${Math.abs(ret.refund_or_owed || 0).toLocaleString()}`,
+    });
+  }
+
+  // Filed event
+  if (ret.filed_at) {
+    timeline.push({
+      timestamp: ret.filed_at,
+      event: 'Return filed',
+      category: 'lifecycle',
+      detail: `Status: ${ret.status}`,
+    });
+  }
+
+  // Sort by timestamp
+  timeline.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+  return c.json({
+    return_id: returnId,
+    tax_year: ret.tax_year,
+    current_status: ret.status,
+    events_count: timeline.length,
+    timeline,
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// TAX KNOWLEDGE SEARCH (reference library)
+// ═══════════════════════════════════════════════════════════════
+
+features.get('/tax-knowledge/search', async (c) => {
+  const query = (c.req.query('q') || '').toLowerCase().trim();
+  if (!query) return c.json({ error: 'Query parameter q is required' }, 400);
+
+  // Comprehensive tax knowledge base
+  const knowledgeBase: Array<{
+    topic: string;
+    category: string;
+    summary: string;
+    irc_section?: string;
+    key_amounts?: Record<string, string>;
+    tips: string[];
+  }> = [
+    {
+      topic: 'Standard Deduction',
+      category: 'deductions',
+      summary: 'A flat dollar amount that reduces your taxable income. Most taxpayers take the standard deduction instead of itemizing.',
+      irc_section: 'IRC §63(c)',
+      key_amounts: { 'Single (2024)': '$14,600', 'MFJ (2024)': '$29,200', 'HOH (2024)': '$21,900', 'Over 65 add': '$1,550/$1,950' },
+      tips: ['Compare with itemized deductions to pick the higher amount', 'Additional amount for age 65+ or blind', 'Cannot use standard deduction if spouse itemizes on separate return'],
+    },
+    {
+      topic: 'Child Tax Credit (CTC)',
+      category: 'credits',
+      summary: 'A credit of up to $2,000 per qualifying child under 17. Up to $1,700 is refundable as the Additional Child Tax Credit.',
+      irc_section: 'IRC §24',
+      key_amounts: { 'Max credit': '$2,000/child', 'Refundable portion': '$1,700', 'Phase-out (Single)': '$200,000', 'Phase-out (MFJ)': '$400,000' },
+      tips: ['Child must have a valid SSN', 'Phase-out reduces credit by $50 per $1,000 over threshold', 'Must be under 17 at end of tax year'],
+    },
+    {
+      topic: 'Earned Income Tax Credit (EITC)',
+      category: 'credits',
+      summary: 'A refundable credit for low-to-moderate income workers. Amount varies by filing status and number of children.',
+      irc_section: 'IRC §32',
+      key_amounts: { 'Max (3+ children)': '$7,830', 'Max (2 children)': '$6,960', 'Max (1 child)': '$4,213', 'Max (no children)': '$632' },
+      tips: ['Must have earned income (wages or self-employment)', 'Investment income must be under $11,600', 'Cannot file as Married Filing Separately', 'AGI limits vary by children count'],
+    },
+    {
+      topic: 'Self-Employment Tax',
+      category: 'employment',
+      summary: 'Social Security and Medicare taxes for self-employed individuals. Rate is 15.3% (12.4% SS + 2.9% Medicare) on 92.35% of net earnings.',
+      irc_section: 'IRC §1401',
+      key_amounts: { 'SS rate': '12.4%', 'Medicare rate': '2.9%', 'Total rate': '15.3%', 'SS wage base (2024)': '$168,600', 'Additional Medicare': '0.9% over $200K/$250K' },
+      tips: ['Deduct half of SE tax on 1040 Schedule 1', 'Net earnings = Schedule C profit × 92.35%', 'Quarterly estimated payments required if $1,000+ owed'],
+    },
+    {
+      topic: 'QBI Deduction (Section 199A)',
+      category: 'deductions',
+      summary: 'Deduction of up to 20% of qualified business income from pass-through entities.',
+      irc_section: 'IRC §199A',
+      key_amounts: { 'Max deduction': '20% of QBI', 'Phase-out (Single)': '$191,950', 'Phase-out (MFJ)': '$383,900' },
+      tips: ['Applies to sole proprietors, partnerships, S corps, certain REITs', 'Specified service businesses (law, accounting, health) have lower thresholds', 'Cannot exceed 20% of taxable income before QBI deduction'],
+    },
+    {
+      topic: 'Capital Gains Tax',
+      category: 'investments',
+      summary: 'Tax on profit from selling assets held over 1 year (long-term) at preferential rates: 0%, 15%, or 20%.',
+      irc_section: 'IRC §1(h)',
+      key_amounts: { '0% rate (Single)': 'up to $47,025', '15% rate (Single)': '$47,026-$518,900', '20% rate (Single)': 'over $518,900', 'NIIT surcharge': '3.8% over $200K/$250K' },
+      tips: ['Short-term gains (<1 year) taxed as ordinary income', 'Tax-loss harvesting can offset gains', 'Primary home sale exclusion: $250K/$500K'],
+    },
+    {
+      topic: 'IRA Contributions',
+      category: 'retirement',
+      summary: 'Traditional IRA contributions may be tax-deductible. Roth IRA contributions are not deductible but grow tax-free.',
+      irc_section: 'IRC §219',
+      key_amounts: { 'Max contribution (2024)': '$7,000', 'Catch-up (50+)': '$1,000 extra', 'Phase-out (single w/plan)': '$77,000-$87,000', 'Phase-out (MFJ w/plan)': '$123,000-$143,000' },
+      tips: ['Deadline is April 15 of following year', 'Can contribute to both Traditional and Roth (combined limit)', 'Required Minimum Distributions start at age 73 for Traditional'],
+    },
+    {
+      topic: 'HSA (Health Savings Account)',
+      category: 'healthcare',
+      summary: 'Triple tax advantage: tax-deductible contributions, tax-free growth, tax-free withdrawals for medical expenses.',
+      irc_section: 'IRC §223',
+      key_amounts: { 'Self-only (2024)': '$4,150', 'Family (2024)': '$8,300', 'Catch-up (55+)': '$1,000 extra' },
+      tips: ['Must have HDHP insurance', 'Funds roll over year to year (no use-it-or-lose-it)', 'After 65, can withdraw for any purpose (taxed as income)', 'Employer contributions count toward limit'],
+    },
+    {
+      topic: 'SALT Deduction Cap',
+      category: 'deductions',
+      summary: 'State and Local Tax deduction is capped at $10,000 ($5,000 MFS). Includes state income, sales, and property taxes.',
+      irc_section: 'IRC §164',
+      key_amounts: { 'Cap (most filers)': '$10,000', 'Cap (MFS)': '$5,000' },
+      tips: ['Includes state income OR sales tax (choose higher)', 'Property taxes count toward the cap', 'Cap may change after TCJA expiration in 2025', 'Some states offer workarounds for pass-through entities'],
+    },
+    {
+      topic: 'Oil & Gas Tax Deductions',
+      category: 'energy',
+      summary: 'Special tax benefits for oil and gas producers: IDC deduction, depletion allowances, and working interest exclusions.',
+      irc_section: 'IRC §263(c), §611-613A',
+      key_amounts: { 'Percentage depletion': '15% of gross income', 'IDC deduction': '100% in first year', 'Small producer exemption': '1,000 bbls/day or 6M cf gas/day' },
+      tips: ['Intangible Drilling Costs (IDC) can be deducted immediately or amortized', 'Percentage depletion cannot exceed 65% of taxable income', 'Working interest income not subject to passive activity rules', 'Our TX12 engine specializes in oil & gas optimization'],
+    },
+    {
+      topic: 'Charitable Contributions',
+      category: 'deductions',
+      summary: 'Donations to qualified organizations are deductible if you itemize. Limits vary by type of donation and organization.',
+      irc_section: 'IRC §170',
+      key_amounts: { 'Cash limit': '60% of AGI', 'Capital gain property': '30% of AGI', 'Private foundations': '30% of AGI (cash)', 'Carryforward': '5 years' },
+      tips: ['Cash donations: receipt required for $250+', 'Non-cash donations: appraisal needed for $5,000+', 'Keep detailed records of all donations', 'Donor-advised funds allow bunching strategy'],
+    },
+    {
+      topic: 'Home Office Deduction',
+      category: 'deductions',
+      summary: 'Deduction for using part of your home regularly and exclusively for business. Two methods: simplified and regular.',
+      irc_section: 'IRC §280A',
+      key_amounts: { 'Simplified method': '$5/sq ft, max 300 sq ft ($1,500)', 'Regular method': 'Actual expenses × business %' },
+      tips: ['Must be regular and exclusive use', 'W-2 employees generally cannot claim (post-TCJA)', 'Regular method: mortgage interest, utilities, insurance, depreciation', 'Keep photos and measurements of home office'],
+    },
+    {
+      topic: 'Education Credits',
+      category: 'credits',
+      summary: 'American Opportunity Credit (up to $2,500) and Lifetime Learning Credit (up to $2,000) for education expenses.',
+      irc_section: 'IRC §25A',
+      key_amounts: { 'AOTC max': '$2,500 (40% refundable)', 'LLC max': '$2,000 (non-refundable)', 'AOTC phase-out (MFJ)': '$160,000-$180,000', 'LLC phase-out (MFJ)': '$160,000-$180,000' },
+      tips: ['AOTC: first 4 years of college only', 'LLC: any post-secondary education, no year limit', 'Cannot claim both for same student in same year', 'Form 1098-T from school required'],
+    },
+    {
+      topic: 'Filing Extensions',
+      category: 'filing',
+      summary: 'Form 4868 grants automatic 6-month extension to file (not to pay). Original deadline is April 15.',
+      irc_section: 'IRC §6081',
+      key_amounts: { 'Extension length': '6 months (to October 15)', 'Penalty for not filing': '5%/month up to 25%', 'Penalty for not paying': '0.5%/month' },
+      tips: ['Extension to file is NOT extension to pay', 'Must estimate and pay any tax due by April 15', 'E-file extension via Form 4868 or make payment with extension request', 'State extensions may require separate filing'],
+    },
+    {
+      topic: 'Estimated Tax Payments',
+      category: 'filing',
+      summary: 'Quarterly payments required if you expect to owe $1,000+ in taxes. Due April 15, June 15, September 15, January 15.',
+      irc_section: 'IRC §6654',
+      key_amounts: { 'Q1 due': 'April 15', 'Q2 due': 'June 15', 'Q3 due': 'September 15', 'Q4 due': 'January 15' },
+      tips: ['Safe harbor: pay 100% of prior year tax (110% if AGI > $150K)', 'Underpayment penalty calculated per quarter', 'Can adjust payments if income varies throughout year', 'Form 2210 to calculate or request waiver of penalty'],
+    },
+  ];
+
+  // Search
+  const results = knowledgeBase.filter(entry => {
+    const searchText = `${entry.topic} ${entry.category} ${entry.summary} ${entry.tips.join(' ')} ${entry.irc_section || ''}`.toLowerCase();
+    return query.split(/\s+/).every(word => searchText.includes(word));
+  });
+
+  return c.json({
+    query,
+    results_count: results.length,
+    results: results.slice(0, 10),
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// RETURN SNAPSHOT (point-in-time summary for archival)
+// ═══════════════════════════════════════════════════════════════
+
+features.post('/:id/snapshot', async (c) => {
+  const returnId = c.req.param('id');
+  const ret = await c.env.DB.prepare('SELECT * FROM returns WHERE id = ?').bind(returnId).first<TaxReturn>();
+  if (!ret) return c.json({ error: 'Return not found' }, 404);
+
+  // Gather all data
+  const [incomeResult, deductionResult, dependentResult] = await Promise.all([
+    c.env.DB.prepare('SELECT * FROM income_items WHERE return_id = ?').bind(returnId).all(),
+    c.env.DB.prepare('SELECT * FROM deductions WHERE return_id = ?').bind(returnId).all(),
+    c.env.DB.prepare('SELECT * FROM dependents WHERE return_id = ?').bind(returnId).all(),
+  ]);
+
+  const snapshot = {
+    snapshot_id: generateId('snap'),
+    created_at: new Date().toISOString(),
+    return_id: returnId,
+    tax_year: ret.tax_year,
+    status: ret.status,
+    client_id: ret.client_id,
+    financials: {
+      total_income: ret.total_income,
+      adjusted_gross_income: ret.adjusted_gross_income,
+      taxable_income: ret.taxable_income,
+      total_tax: ret.total_tax,
+      total_payments: ret.total_payments,
+      refund_or_owed: ret.refund_or_owed,
+      deduction_method: ret.deduction_method,
+    },
+    income_items: incomeResult.results,
+    deductions: deductionResult.results,
+    dependents: dependentResult.results,
+    preparer_ptin: ret.preparer_ptin,
+  };
+
+  // Store to KV for long-term access
+  await c.env.CACHE.put(
+    `snapshot:${returnId}:${snapshot.snapshot_id}`,
+    JSON.stringify(snapshot),
+    { expirationTtl: 60 * 60 * 24 * 365 } // 1 year
+  );
+
+  return c.json({ snapshot });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// RETURN VALIDATION (pre-filing completeness check)
+// ═══════════════════════════════════════════════════════════════
+
+features.get('/:id/validate', async (c) => {
+  const returnId = c.req.param('id');
+  const ret = await c.env.DB.prepare('SELECT * FROM returns WHERE id = ?').bind(returnId).first<TaxReturn>();
+  if (!ret) return c.json({ error: 'Return not found' }, 404);
+
+  const client = await c.env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(ret.client_id).first<Client>();
+
+  const errors: Array<{ field: string; message: string; severity: 'error' | 'warning' }> = [];
+  const warnings: Array<{ field: string; message: string; severity: 'warning' }> = [];
+
+  // Client validation
+  if (!client) {
+    errors.push({ field: 'client', message: 'Client record not found', severity: 'error' });
+  } else {
+    const cl = client as any;
+    if (!cl.first_name || !cl.last_name) errors.push({ field: 'client.name', message: 'Client name is required', severity: 'error' });
+    if (!cl.ssn_encrypted) errors.push({ field: 'client.ssn', message: 'SSN is required for filing', severity: 'error' });
+    if (!cl.address_street) warnings.push({ field: 'client.address', message: 'Address is recommended', severity: 'warning' });
+    if (!cl.filing_status) errors.push({ field: 'client.filing_status', message: 'Filing status is required', severity: 'error' });
+    if (!cl.dob) warnings.push({ field: 'client.dob', message: 'Date of birth helps determine eligibility for credits', severity: 'warning' });
+  }
+
+  // Return validation
+  if (!ret.tax_year) errors.push({ field: 'return.tax_year', message: 'Tax year is required', severity: 'error' });
+  if (ret.total_income === 0) warnings.push({ field: 'return.income', message: 'No income recorded — verify before filing', severity: 'warning' });
+  if (ret.total_tax === 0 && ret.total_income > 0) errors.push({ field: 'return.calculation', message: 'Return has not been calculated', severity: 'error' });
+  if (!ret.preparer_ptin) warnings.push({ field: 'return.ptin', message: 'Preparer PTIN recommended for professional preparation', severity: 'warning' });
+
+  // Income validation
+  const income = await c.env.DB.prepare('SELECT * FROM income_items WHERE return_id = ?').bind(returnId).all();
+  if (income.results.length === 0) warnings.push({ field: 'income', message: 'No income items recorded', severity: 'warning' });
+
+  // Check for W-2 consistency
+  const wageIncome = (income.results as any[]).filter(i => i.category === 'wages');
+  const totalWithholding = (income.results as any[]).reduce((s: number, i: any) => s + (i.tax_withheld || 0), 0);
+  if (wageIncome.length > 0 && totalWithholding === 0) {
+    warnings.push({ field: 'income.withholding', message: 'Wage income detected but no tax withholding recorded', severity: 'warning' });
+  }
+
+  // Deduction validation
+  const deductions = await c.env.DB.prepare('SELECT * FROM deductions WHERE return_id = ?').bind(returnId).all();
+  if (ret.deduction_method === 'itemized' && deductions.results.length === 0) {
+    errors.push({ field: 'deductions', message: 'Itemized deduction selected but no deductions recorded', severity: 'error' });
+  }
+
+  // Dependent validation
+  const dependents = await c.env.DB.prepare('SELECT * FROM dependents WHERE return_id = ?').bind(returnId).all();
+  for (const dep of dependents.results as any[]) {
+    if (!dep.first_name || !dep.last_name) warnings.push({ field: `dependent.${dep.id}`, message: 'Dependent name incomplete', severity: 'warning' });
+    if (!dep.ssn_encrypted) warnings.push({ field: `dependent.${dep.id}.ssn`, message: `Dependent ${dep.first_name || 'unnamed'}: SSN needed for CTC`, severity: 'warning' });
+  }
+
+  const allIssues = [...errors, ...warnings];
+  const isValid = errors.length === 0;
+  const score = Math.max(0, 100 - errors.length * 15 - warnings.length * 5);
+
+  return c.json({
+    return_id: returnId,
+    tax_year: ret.tax_year,
+    is_valid: isValid,
+    ready_to_file: isValid && ret.total_tax > 0,
+    completeness_score: score,
+    errors_count: errors.length,
+    warnings_count: warnings.length,
+    issues: allIssues,
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// PREPARER DASHBOARD (Commander view of all clients/returns)
+// ═══════════════════════════════════════════════════════════════
+
+features.get('/preparer/dashboard', async (c) => {
+  // All returns with client info
+  const returnsResult = await c.env.DB.prepare(`
+    SELECT r.*, c.first_name, c.last_name, c.email, c.filing_status as client_filing_status
+    FROM returns r JOIN clients c ON r.client_id = c.id
+    ORDER BY r.updated_at DESC
+  `).all();
+
+  const clientsResult = await c.env.DB.prepare('SELECT COUNT(*) as cnt FROM clients').first<{ cnt: number }>();
+
+  const rets = returnsResult.results as any[];
+
+  // Status breakdown
+  const statusCounts: Record<string, number> = {};
+  for (const r of rets) {
+    statusCounts[r.status] = (statusCounts[r.status] || 0) + 1;
+  }
+
+  // Revenue by year
+  const yearStats: Record<number, { count: number; income: number; tax: number; refunds: number }> = {};
+  for (const r of rets) {
+    if (!yearStats[r.tax_year]) yearStats[r.tax_year] = { count: 0, income: 0, tax: 0, refunds: 0 };
+    yearStats[r.tax_year].count++;
+    yearStats[r.tax_year].income += r.total_income || 0;
+    yearStats[r.tax_year].tax += r.total_tax || 0;
+    if (r.refund_or_owed > 0) yearStats[r.tax_year].refunds += r.refund_or_owed;
+  }
+
+  // Action items
+  const needsAttention = rets.filter(r => r.status === 'review').map(r => ({
+    return_id: r.id,
+    client: `${r.first_name} ${r.last_name}`,
+    tax_year: r.tax_year,
+    action: 'Review and approve for filing',
+  }));
+
+  const needsCalculation = rets.filter(r => ['intake', 'documents'].includes(r.status)).map(r => ({
+    return_id: r.id,
+    client: `${r.first_name} ${r.last_name}`,
+    tax_year: r.tax_year,
+    action: 'Calculate return',
+  }));
+
+  return c.json({
+    preparer: 'Bobby Don McWilliams II',
+    timestamp: new Date().toISOString(),
+    totals: {
+      clients: clientsResult?.cnt || 0,
+      returns: rets.length,
+      filed: rets.filter(r => ['filed', 'accepted'].includes(r.status)).length,
+      pending: rets.filter(r => !['filed', 'accepted', 'rejected'].includes(r.status)).length,
+      total_income_processed: rets.reduce((s, r) => s + (r.total_income || 0), 0),
+      total_tax_calculated: rets.reduce((s, r) => s + (r.total_tax || 0), 0),
+      total_refunds: rets.filter(r => r.refund_or_owed > 0).reduce((s, r) => s + r.refund_or_owed, 0),
+    },
+    status_breakdown: statusCounts,
+    year_stats: yearStats,
+    action_items: [...needsAttention, ...needsCalculation],
+    recent_returns: rets.slice(0, 20).map(r => ({
+      id: r.id,
+      client: `${r.first_name} ${r.last_name}`,
+      email: r.email,
+      tax_year: r.tax_year,
+      status: r.status,
+      income: r.total_income,
+      refund_owed: r.refund_or_owed,
+      updated: r.updated_at,
+    })),
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
 // HELPERS
 // ═══════════════════════════════════════════════════════════════
 

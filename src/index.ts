@@ -55,9 +55,9 @@ app.get('/health', async (c) => {
   return c.json({
     status: 'healthy',
     service: 'echo-tax-return',
-    version: '2.5.0',
+    version: '3.0.0',
     timestamp: new Date().toISOString(),
-    features: ['multi-year', 'what-if', 'audit-risk', 'amendments', 'penalty-calc', 'notes', 'engagement-letter', 'export', 'income-projector', 'tax-calendar', 'tax-tips', 'withholding-estimator', 'batch-calculate', 'return-diff', 'document-checklist', 'bracket-analysis', 'return-locking', 'client-portal', 'deduction-maximizer'],
+    features: ['multi-year', 'what-if', 'audit-risk', 'amendments', 'penalty-calc', 'notes', 'engagement-letter', 'export', 'income-projector', 'tax-calendar', 'tax-tips', 'withholding-estimator', 'batch-calculate', 'return-diff', 'document-checklist', 'bracket-analysis', 'return-locking', 'client-portal', 'deduction-maximizer', 'client-summary', 'return-timeline', 'tax-knowledge-search', 'return-snapshot', 'return-validation', 'preparer-dashboard'],
     database: dbCheck ? 'connected' : 'error',
     clients: dbCheck?.cnt || 0,
   });
@@ -84,7 +84,7 @@ app.get('/pricing', async (c) => {
 app.get('/docs', (c) => {
   return c.json({
     service: 'echo-tax-return',
-    version: '2.5.0',
+    version: '3.0.0',
     preparer: 'Bobby Don McWilliams II',
     base_url: 'https://echo-tax-return.bmcii1976.workers.dev',
     auth: { header: 'X-Echo-API-Key', alt: 'Authorization: Bearer <key>' },
@@ -168,6 +168,12 @@ app.get('/docs', (c) => {
         { method: 'POST', path: '/returns/portal-token', description: 'Generate client portal access token' },
         { method: 'GET', path: '/returns/portal/:token', description: 'Client portal read-only view' },
         { method: 'GET', path: '/returns/:id/deduction-opportunities', description: 'Find unclaimed deduction opportunities' },
+        { method: 'GET', path: '/returns/client-summary/:clientId', description: 'Comprehensive client dashboard summary' },
+        { method: 'GET', path: '/returns/:id/timeline', description: 'Return activity timeline' },
+        { method: 'GET', path: '/returns/tax-knowledge/search?q=X', description: 'Tax knowledge reference search' },
+        { method: 'POST', path: '/returns/:id/snapshot', description: 'Create point-in-time return snapshot' },
+        { method: 'GET', path: '/returns/:id/validate', description: 'Pre-filing validation check' },
+        { method: 'GET', path: '/returns/preparer/dashboard', description: 'Preparer dashboard (Commander only)' },
       ],
       billing: [
         { method: 'POST', path: '/billing/checkout', description: 'Create Stripe checkout session' },
