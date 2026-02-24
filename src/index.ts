@@ -4,13 +4,15 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import type { Env, TaxReturn } from './types';
-import { requireAuth, isCommander, generateId } from './auth';
+import { requireAuth, isCommander, generateId, rateLimit, requestLogger } from './auth';
 import { calculateTaxReturn, generateForm1040 } from './calculator';
 import clients from './clients';
 import returns from './returns';
 import documents from './documents';
 import optimizer from './optimizer';
 import billing from './billing';
+import efile from './efile';
+import features from './features';
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -19,6 +21,8 @@ app.use('*', cors({
   origin: [
     'https://echo-ept.com',
     'https://echo-op.com',
+    'https://echo-lgt.com',
+    'https://www.echo-lgt.com',
     'http://localhost:3000',
     'http://localhost:3001',
   ],
@@ -27,13 +31,30 @@ app.use('*', cors({
   maxAge: 86400,
 }));
 
+// ─── Security: Rate Limiting + Request Logging ──────────────
+app.use('*', requestLogger());
+app.use('/clients/*', rateLimit(100, 60));
+app.use('/returns/*', rateLimit(100, 60));
+app.use('/documents/*', rateLimit(30, 60));
+app.use('/billing/*', rateLimit(10, 60));
+
+// ─── Security Headers ───────────────────────────────────────
+app.use('*', async (c, next) => {
+  await next();
+  c.res.headers.set('X-Content-Type-Options', 'nosniff');
+  c.res.headers.set('X-Frame-Options', 'DENY');
+  c.res.headers.set('X-XSS-Protection', '1; mode=block');
+  c.res.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+  c.res.headers.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+});
+
 // ─── Health Check (no auth) ──────────────────────────────────
 app.get('/health', async (c) => {
   const dbCheck = await c.env.DB.prepare('SELECT COUNT(*) as cnt FROM clients').first<{ cnt: number }>().catch(() => null);
   return c.json({
     status: 'healthy',
     service: 'echo-tax-return',
-    version: '1.0.0',
+    version: '2.1.0',
     timestamp: new Date().toISOString(),
     database: dbCheck ? 'connected' : 'error',
     clients: dbCheck?.cnt || 0,
@@ -57,6 +78,84 @@ app.get('/pricing', async (c) => {
   });
 });
 
+// ─── API Documentation (no auth) ────────────────────────────
+app.get('/docs', (c) => {
+  return c.json({
+    service: 'echo-tax-return',
+    version: '2.1.0',
+    preparer: 'Bobby Don McWilliams II',
+    base_url: 'https://echo-tax-return.bmcii1976.workers.dev',
+    auth: { header: 'X-Echo-API-Key', alt: 'Authorization: Bearer <key>' },
+    endpoints: {
+      public: [
+        { method: 'GET', path: '/health', description: 'Service health check' },
+        { method: 'GET', path: '/pricing', description: 'Service pricing tiers' },
+        { method: 'GET', path: '/docs', description: 'API documentation' },
+      ],
+      clients: [
+        { method: 'POST', path: '/clients', description: 'Create client profile' },
+        { method: 'GET', path: '/clients/:id', description: 'Get client details' },
+        { method: 'PUT', path: '/clients/:id', description: 'Update client profile' },
+        { method: 'GET', path: '/clients', description: 'List all clients (Commander)' },
+      ],
+      returns: [
+        { method: 'POST', path: '/returns', description: 'Create tax return' },
+        { method: 'GET', path: '/returns/:id', description: 'Get return details' },
+        { method: 'GET', path: '/returns', description: 'List returns (filter by client/year/status)' },
+        { method: 'POST', path: '/returns/:id/calculate', description: 'Calculate tax return' },
+        { method: 'GET', path: '/returns/:id/calculation', description: 'Get cached calculation' },
+        { method: 'GET', path: '/returns/:id/forms', description: 'Generate Form 1040 + schedules' },
+        { method: 'POST', path: '/returns/:id/review', description: 'Mark return for review' },
+        { method: 'POST', path: '/returns/:id/optimize', description: 'Get TX engine optimization suggestions' },
+      ],
+      income: [
+        { method: 'POST', path: '/returns/:id/income', description: 'Add income item' },
+        { method: 'DELETE', path: '/returns/:id/income/:itemId', description: 'Remove income item' },
+      ],
+      deductions: [
+        { method: 'POST', path: '/returns/:id/deductions', description: 'Add deduction' },
+        { method: 'DELETE', path: '/returns/:id/deductions/:dedId', description: 'Remove deduction' },
+      ],
+      dependents: [
+        { method: 'POST', path: '/returns/:id/dependents', description: 'Add dependent' },
+        { method: 'DELETE', path: '/returns/:id/dependents/:depId', description: 'Remove dependent' },
+      ],
+      filing: [
+        { method: 'GET', path: '/returns/:id/filing-package', description: 'Get filing package' },
+        { method: 'POST', path: '/returns/:id/file', description: 'File return (efile/paper)' },
+        { method: 'POST', path: '/returns/batch-file', description: 'Batch file all returns for client' },
+        { method: 'GET', path: '/returns/:id/printable', description: 'Get printable return' },
+      ],
+      documents: [
+        { method: 'POST', path: '/documents/upload', description: 'Upload W-2/1099/receipt' },
+        { method: 'GET', path: '/documents/:returnId', description: 'List documents for return' },
+        { method: 'POST', path: '/documents/:id/parse', description: 'Parse document with OCR' },
+      ],
+      tools: [
+        { method: 'POST', path: '/returns/:id/what-if', description: 'What-if tax scenario' },
+        { method: 'GET', path: '/returns/compare?client_id=X', description: 'Multi-year comparison' },
+        { method: 'GET', path: '/returns/:id/audit-risk', description: 'Audit risk assessment' },
+        { method: 'POST', path: '/returns/:id/withholding-estimate', description: 'W-4 withholding estimator' },
+        { method: 'GET', path: '/returns/:id/summary', description: 'Comprehensive return summary' },
+        { method: 'GET', path: '/returns/supported-years', description: 'Supported tax years' },
+        { method: 'POST', path: '/returns/:id/estimated-payments', description: 'Add estimated payment' },
+        { method: 'GET', path: '/returns/:id/estimated-payments', description: 'List estimated payments' },
+        { method: 'POST', path: '/returns/:id/amendments', description: 'Create amendment (1040-X)' },
+        { method: 'GET', path: '/returns/:id/amendments', description: 'List amendments' },
+      ],
+      billing: [
+        { method: 'POST', path: '/billing/checkout', description: 'Create Stripe checkout session' },
+        { method: 'POST', path: '/billing/webhook', description: 'Stripe webhook handler' },
+      ],
+      admin: [
+        { method: 'GET', path: '/stats', description: 'Dashboard stats (Commander only)' },
+      ],
+    },
+    supported_years: [2019, 2020, 2021, 2022, 2023, 2024],
+    tax_engines: 'TX01-TX14 (14 AI Tax Intelligence Engines)',
+  });
+});
+
 // ─── Auth required for all other routes ──────────────────────
 app.use('/clients/*', requireAuth());
 app.use('/returns/*', requireAuth());
@@ -69,6 +168,8 @@ app.route('/clients', clients);
 app.route('/returns', returns);
 app.route('/documents', documents);
 app.route('/billing', billing);
+app.route('/returns', efile);
+app.route('/returns', features);
 
 // ─── Tax Calculation Endpoints ───────────────────────────────
 app.post('/returns/:id/calculate', requireAuth(), async (c) => {

@@ -1,100 +1,7 @@
 // Echo Tax Return — Full 1040 Tax Calculation Engine
-// Implements 2024 tax brackets, standard deductions, credits, and schedules
+// Multi-year support (2019-2024) via tax-data.ts
 import type { Env, FilingStatus, DeductionMethod, TaxCalculation, BracketDetail, IncomeItem, Deduction, Dependent, FormLine, Form1040, Client } from './types';
-
-// ═══════════════════════════════════════════════════════════════
-// 2024 TAX YEAR CONSTANTS (for returns filed in 2025)
-// ═══════════════════════════════════════════════════════════════
-
-const TAX_BRACKETS_2024: Record<FilingStatus, Array<{ rate: number; min: number; max: number }>> = {
-  single: [
-    { rate: 0.10, min: 0, max: 11600 },
-    { rate: 0.12, min: 11600, max: 47150 },
-    { rate: 0.22, min: 47150, max: 100525 },
-    { rate: 0.24, min: 100525, max: 191950 },
-    { rate: 0.32, min: 191950, max: 243725 },
-    { rate: 0.35, min: 243725, max: 609350 },
-    { rate: 0.37, min: 609350, max: Infinity },
-  ],
-  married_joint: [
-    { rate: 0.10, min: 0, max: 23200 },
-    { rate: 0.12, min: 23200, max: 94300 },
-    { rate: 0.22, min: 94300, max: 201050 },
-    { rate: 0.24, min: 201050, max: 383900 },
-    { rate: 0.32, min: 383900, max: 487450 },
-    { rate: 0.35, min: 487450, max: 731200 },
-    { rate: 0.37, min: 731200, max: Infinity },
-  ],
-  married_separate: [
-    { rate: 0.10, min: 0, max: 11600 },
-    { rate: 0.12, min: 11600, max: 47150 },
-    { rate: 0.22, min: 47150, max: 100525 },
-    { rate: 0.24, min: 100525, max: 191950 },
-    { rate: 0.32, min: 191950, max: 243725 },
-    { rate: 0.35, min: 243725, max: 365600 },
-    { rate: 0.37, min: 365600, max: Infinity },
-  ],
-  head_of_household: [
-    { rate: 0.10, min: 0, max: 16550 },
-    { rate: 0.12, min: 16550, max: 63100 },
-    { rate: 0.22, min: 63100, max: 100500 },
-    { rate: 0.24, min: 100500, max: 191950 },
-    { rate: 0.32, min: 191950, max: 243700 },
-    { rate: 0.35, min: 243700, max: 609350 },
-    { rate: 0.37, min: 609350, max: Infinity },
-  ],
-  widow: [
-    { rate: 0.10, min: 0, max: 23200 },
-    { rate: 0.12, min: 23200, max: 94300 },
-    { rate: 0.22, min: 94300, max: 201050 },
-    { rate: 0.24, min: 201050, max: 383900 },
-    { rate: 0.32, min: 383900, max: 487450 },
-    { rate: 0.35, min: 487450, max: 731200 },
-    { rate: 0.37, min: 731200, max: Infinity },
-  ],
-};
-
-const STANDARD_DEDUCTION_2024: Record<FilingStatus, number> = {
-  single: 14600,
-  married_joint: 29200,
-  married_separate: 14600,
-  head_of_household: 21900,
-  widow: 29200,
-};
-
-// Additional standard deduction for age 65+ or blind
-const ADDITIONAL_DEDUCTION_2024 = {
-  single: 1950,
-  married: 1550,
-};
-
-// Self-employment tax rate
-const SE_TAX_RATE = 0.153; // 15.3% (12.4% SS + 2.9% Medicare)
-const SE_INCOME_FACTOR = 0.9235; // 92.35% of net SE income is subject to SE tax
-const SS_WAGE_BASE_2024 = 168600; // Social Security wage base
-
-// Child Tax Credit
-const CTC_AMOUNT = 2000;
-const CTC_PHASEOUT_SINGLE = 200000;
-const CTC_PHASEOUT_JOINT = 400000;
-const CTC_REFUNDABLE_MAX = 1700; // ACTC max per child (2024)
-
-// Other Dependent Credit
-const ODC_AMOUNT = 500;
-
-// EITC 2024 (simplified — max amounts by children)
-const EITC_2024: Record<number, { max: number; phaseout_start_single: number; phaseout_start_joint: number; phaseout_end_single: number; phaseout_end_joint: number }> = {
-  0: { max: 632, phaseout_start_single: 9800, phaseout_start_joint: 16370, phaseout_end_single: 18591, phaseout_end_joint: 25511, },
-  1: { max: 3995, phaseout_start_single: 12390, phaseout_start_joint: 18970, phaseout_end_single: 46560, phaseout_end_joint: 53120, },
-  2: { max: 6604, phaseout_start_single: 12390, phaseout_start_joint: 18970, phaseout_end_single: 52918, phaseout_end_joint: 59478, },
-  3: { max: 7430, phaseout_start_single: 12390, phaseout_start_joint: 18970, phaseout_end_single: 56838, phaseout_end_joint: 63398, },
-};
-
-// QBI deduction rate (Section 199A)
-const QBI_RATE = 0.20;
-
-// SALT cap
-const SALT_CAP = 10000;
+import { getTaxBrackets, getStandardDeduction, getSSWageBase, getCTCParams, getEITCParams, getSALTCap, getQBIRate, getSEIncomeFactor, getODCAmount } from './tax-data';
 
 // ═══════════════════════════════════════════════════════════════
 // MAIN CALCULATION FUNCTION
@@ -111,7 +18,12 @@ export async function calculateTaxReturn(
   const client = await env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(ret.client_id).first<Client>();
   if (!client) throw new Error('Client not found');
 
+  const taxYear: number = ret.tax_year;
   const filingStatus: FilingStatus = client.filing_status || 'single';
+  const seIncomeFactor = getSEIncomeFactor();
+  const saltCap = getSALTCap();
+  const qbiRate = getQBIRate();
+  const odcAmount = getODCAmount();
 
   const [incomeResult, deductionResult, dependentResult] = await Promise.all([
     env.DB.prepare('SELECT * FROM income_items WHERE return_id = ?').bind(returnId).all<IncomeItem>(),
@@ -122,6 +34,15 @@ export async function calculateTaxReturn(
   const incomeItems = incomeResult.results;
   const deductions = deductionResult.results;
   const dependents = dependentResult.results;
+
+  // Also load estimated payments from estimated_payments table (if it exists)
+  let estimatedPaymentsTotal = 0;
+  try {
+    const epResult = await env.DB.prepare(
+      'SELECT SUM(amount) as total FROM estimated_payments WHERE return_id = ?'
+    ).bind(returnId).first<{ total: number | null }>();
+    estimatedPaymentsTotal = epResult?.total || 0;
+  } catch { /* table may not exist yet */ }
 
   // ─── Step 1: Calculate Income by Category ──────────────────
   const incomeSummary = {
@@ -137,7 +58,7 @@ export async function calculateTaxReturn(
     total: 0,
   };
 
-  // Social Security taxable amount (simplified: up to 85% taxable based on provisional income)
+  // Social Security taxable amount (up to 85% taxable based on provisional income)
   const ssaTaxable = calculateSSATaxable(incomeSummary.social_security, incomeSummary, filingStatus);
   incomeSummary.social_security = ssaTaxable;
 
@@ -148,17 +69,17 @@ export async function calculateTaxReturn(
     student_loan: Math.min(sumByCategory(deductions, 'student_loan'), 2500),
     ira: sumByCategory(deductions, 'ira'),
     hsa: sumByCategory(deductions, 'hsa'),
-    se_tax: 0, // calculated below
-    educator: Math.min(sumByCategory(deductions, 'educator'), 300),
+    se_tax: 0,
+    educator: Math.min(sumByCategory(deductions, 'educator'), taxYear >= 2022 ? 300 : 250),
     alimony: sumByCategory(deductions, 'alimony'),
     total: 0,
   };
 
   // Self-employment tax deduction (half of SE tax)
   if (incomeSummary.business > 0) {
-    const seIncome = incomeSummary.business * SE_INCOME_FACTOR;
-    const seTax = calculateSETax(seIncome, incomeSummary.wages);
-    adjustments.se_tax = Math.round(seTax / 2 * 100) / 100; // deductible half
+    const seIncome = incomeSummary.business * seIncomeFactor;
+    const seTax = calculateSETax(seIncome, incomeSummary.wages, taxYear);
+    adjustments.se_tax = Math.round(seTax / 2 * 100) / 100;
   }
 
   adjustments.total = adjustments.student_loan + adjustments.ira + adjustments.hsa +
@@ -168,12 +89,12 @@ export async function calculateTaxReturn(
   const agi = Math.max(0, incomeSummary.total - adjustments.total);
 
   // ─── Step 4: Deductions (Standard vs Itemized) ─────────────
-  const standardDeduction = STANDARD_DEDUCTION_2024[filingStatus];
+  const standardDeduction = getStandardDeduction(taxYear, filingStatus);
 
   // Itemized deductions (Schedule A)
-  const medicalFloor = agi * 0.075; // 7.5% AGI floor
+  const medicalFloor = agi * 0.075;
   const medicalDeduction = Math.max(0, sumByCategory(deductions, 'medical') - medicalFloor);
-  const saltDeduction = Math.min(sumByCategory(deductions, 'salt'), SALT_CAP);
+  const saltDeduction = Math.min(sumByCategory(deductions, 'salt'), saltCap);
   const mortgageInterest = sumByCategory(deductions, 'mortgage_interest');
   const charitable = sumByCategory(deductions, 'charitable');
   const itemizedTotal = medicalDeduction + saltDeduction + mortgageInterest + charitable;
@@ -184,18 +105,17 @@ export async function calculateTaxReturn(
   // ─── Step 5: QBI Deduction (Section 199A) ──────────────────
   let qbiDeduction = 0;
   if (incomeSummary.business > 0) {
-    // Simplified QBI: 20% of qualified business income, limited to 20% of taxable income before QBI
     const qbi = incomeSummary.business - adjustments.se_tax;
     const taxableBeforeQBI = agi - deductionAmount;
-    qbiDeduction = Math.min(qbi * QBI_RATE, taxableBeforeQBI * QBI_RATE);
+    qbiDeduction = Math.min(qbi * qbiRate, taxableBeforeQBI * qbiRate);
     qbiDeduction = Math.max(0, Math.round(qbiDeduction * 100) / 100);
   }
 
   // ─── Step 6: Taxable Income ────────────────────────────────
   const taxableIncome = Math.max(0, agi - deductionAmount - qbiDeduction);
 
-  // ─── Step 7: Calculate Tax from Brackets ───────────────────
-  const brackets = TAX_BRACKETS_2024[filingStatus];
+  // ─── Step 7: Calculate Tax from Year-Specific Brackets ─────
+  const brackets = getTaxBrackets(taxYear, filingStatus);
   const bracketDetail: BracketDetail[] = [];
   let regularTax = 0;
   let remaining = taxableIncome;
@@ -217,15 +137,15 @@ export async function calculateTaxReturn(
   }
   regularTax = Math.round(regularTax * 100) / 100;
 
-  // ─── Step 8: Credits ───────────────────────────────────────
+  // ─── Step 8: Credits (year-aware) ──────────────────────────
   const ctcChildren = dependents.filter(d => d.qualifies_ctc).length;
   const odcDependents = dependents.filter(d => d.qualifies_odc && !d.qualifies_ctc).length;
 
   const credits = {
-    ctc: calculateCTC(ctcChildren, agi, filingStatus),
-    eitc: calculateEITC(agi, incomeItems, dependents, filingStatus),
-    education: 0, // American Opportunity / Lifetime Learning — requires manual input
-    other: odcDependents * ODC_AMOUNT,
+    ctc: calculateCTC(ctcChildren, agi, filingStatus, taxYear),
+    eitc: calculateEITC(agi, incomeItems, dependents, filingStatus, taxYear),
+    education: 0,
+    other: odcDependents * odcAmount,
     total: 0,
   };
   credits.total = credits.ctc + credits.eitc + credits.education + credits.other;
@@ -233,13 +153,13 @@ export async function calculateTaxReturn(
   // ─── Step 9: Other Taxes ───────────────────────────────────
   const otherTaxes = {
     se_tax: 0,
-    amt: 0, // AMT calculation simplified out
+    amt: 0,
     total: 0,
   };
 
   if (incomeSummary.business > 0) {
-    const seIncome = incomeSummary.business * SE_INCOME_FACTOR;
-    otherTaxes.se_tax = calculateSETax(seIncome, incomeSummary.wages);
+    const seIncome = incomeSummary.business * seIncomeFactor;
+    otherTaxes.se_tax = calculateSETax(seIncome, incomeSummary.wages, taxYear);
   }
   otherTaxes.total = otherTaxes.se_tax + otherTaxes.amt;
 
@@ -248,16 +168,19 @@ export async function calculateTaxReturn(
 
   // ─── Step 11: Payments / Withholding ───────────────────────
   const totalWithholding = incomeItems.reduce((sum, item) => sum + (item.tax_withheld || 0), 0);
-  const estimatedPayments = 0; // TODO: allow manual entry of estimated tax payments
 
   const payments = {
     withholding: Math.round(totalWithholding * 100) / 100,
-    estimated: estimatedPayments,
-    total: Math.round((totalWithholding + estimatedPayments) * 100) / 100,
+    estimated: Math.round(estimatedPaymentsTotal * 100) / 100,
+    total: Math.round((totalWithholding + estimatedPaymentsTotal) * 100) / 100,
   };
 
   // ─── Step 12: Refund or Amount Owed ────────────────────────
   const refundOrOwed = Math.round((payments.total - totalTax) * 100) / 100;
+
+  // ─── Step 13: Effective & Marginal Tax Rate ────────────────
+  const effectiveRate = incomeSummary.total > 0 ? Math.round((totalTax / incomeSummary.total) * 10000) / 100 : 0;
+  const marginalRate = bracketDetail.length > 0 ? bracketDetail[bracketDetail.length - 1].rate * 100 : 0;
 
   // ─── Store Results to D1 ───────────────────────────────────
   await env.DB.prepare(`
@@ -275,7 +198,7 @@ export async function calculateTaxReturn(
 
   return {
     return_id: returnId,
-    tax_year: ret.tax_year,
+    tax_year: taxYear,
     filing_status: filingStatus,
     income_summary: incomeSummary,
     adjustments,
@@ -295,6 +218,8 @@ export async function calculateTaxReturn(
     total_tax: totalTax,
     payments,
     refund_or_owed: refundOrOwed,
+    effective_rate: effectiveRate,
+    marginal_rate: marginalRate,
   };
 }
 
@@ -360,7 +285,7 @@ export async function generateForm1040(env: Env, returnId: string): Promise<Form
   if (calc.other_taxes.se_tax > 0) {
     schedules.schedule_2 = [{ line: 'S2-4', description: 'Self-employment tax', amount: calc.other_taxes.se_tax }];
     schedules.schedule_se = [
-      { line: 'SE-3', description: 'Net SE earnings', amount: calc.income_summary.business * SE_INCOME_FACTOR },
+      { line: 'SE-3', description: 'Net SE earnings', amount: calc.income_summary.business * getSEIncomeFactor() },
       { line: 'SE-12', description: 'SE tax', amount: calc.other_taxes.se_tax },
     ];
   }
@@ -411,11 +336,13 @@ function sumByCategory(items: Array<{ category: string; amount: number }>, categ
     .reduce((sum, i) => sum + (i.amount || 0), 0);
 }
 
-function calculateSETax(seIncome: number, w2Wages: number): number {
+function calculateSETax(seIncome: number, w2Wages: number, taxYear: number = 2024): number {
   if (seIncome <= 0) return 0;
 
+  const ssWageBase = getSSWageBase(taxYear);
+
   // Social Security portion: 12.4% on income up to wage base (minus W-2 wages)
-  const ssBase = Math.max(0, SS_WAGE_BASE_2024 - w2Wages);
+  const ssBase = Math.max(0, ssWageBase - w2Wages);
   const ssTaxableIncome = Math.min(seIncome, ssBase);
   const ssTax = ssTaxableIncome * 0.124;
 
@@ -454,10 +381,11 @@ function calculateSSATaxable(
   return Math.min(totalBenefits * 0.85, base + excess);
 }
 
-function calculateCTC(numChildren: number, agi: number, filingStatus: FilingStatus): number {
+function calculateCTC(numChildren: number, agi: number, filingStatus: FilingStatus, taxYear: number = 2024): number {
   if (numChildren <= 0) return 0;
-  const maxCredit = numChildren * CTC_AMOUNT;
-  const phaseoutThreshold = (filingStatus === 'married_joint') ? CTC_PHASEOUT_JOINT : CTC_PHASEOUT_SINGLE;
+  const ctcParams = getCTCParams(taxYear);
+  const maxCredit = numChildren * ctcParams.amount;
+  const phaseoutThreshold = (filingStatus === 'married_joint') ? ctcParams.phaseout_joint : ctcParams.phaseout_single;
   const excess = Math.max(0, agi - phaseoutThreshold);
   const reduction = Math.floor(excess / 1000) * 50;
   return Math.max(0, maxCredit - reduction);
@@ -467,21 +395,22 @@ function calculateEITC(
   agi: number,
   incomeItems: IncomeItem[],
   dependents: Dependent[],
-  filingStatus: FilingStatus
+  filingStatus: FilingStatus,
+  taxYear: number = 2024
 ): number {
-  // Investment income limit for EITC: $11,600 (2024)
+  const qualifyingChildren = Math.min(3, dependents.filter(d => d.qualifies_ctc).length);
+  const eitcParams = getEITCParams(taxYear, qualifyingChildren);
+  if (!eitcParams) return 0;
+
+  // Investment income limit (year-specific)
   const investmentIncome = sumByCategory(incomeItems, 'interest') +
     sumByCategory(incomeItems, 'dividends') +
     sumByCategory(incomeItems, 'capital_gains');
-  if (investmentIncome > 11600) return 0;
+  if (investmentIncome > eitcParams.investment_income_limit) return 0;
 
   // Must have earned income
   const earnedIncome = sumByCategory(incomeItems, 'wages') + sumByCategory(incomeItems, 'business');
   if (earnedIncome <= 0) return 0;
-
-  const qualifyingChildren = Math.min(3, dependents.filter(d => d.qualifies_ctc).length);
-  const eitcParams = EITC_2024[qualifyingChildren];
-  if (!eitcParams) return 0;
 
   const isJoint = filingStatus === 'married_joint';
   const phaseoutStart = isJoint ? eitcParams.phaseout_start_joint : eitcParams.phaseout_start_single;

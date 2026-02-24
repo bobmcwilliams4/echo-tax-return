@@ -22,8 +22,8 @@ returns.post('/', async (c) => {
   if (!body.client_id || !body.tax_year) {
     return c.json({ error: 'client_id and tax_year are required' }, 400);
   }
-  if (body.tax_year < 2020 || body.tax_year > 2025) {
-    return c.json({ error: 'tax_year must be between 2020 and 2025' }, 400);
+  if (body.tax_year < 2018 || body.tax_year > 2025) {
+    return c.json({ error: 'tax_year must be between 2018 and 2025' }, 400);
   }
 
   // Verify client exists

@@ -42,3 +42,60 @@ export function generateId(prefix: string): string {
   const rand = Math.random().toString(36).substring(2, 10);
   return `${prefix}_${ts}${rand}`;
 }
+
+/** Rate limiting middleware using KV */
+export function rateLimit(maxRequests: number = 60, windowSeconds: number = 60) {
+  return async (c: Context<{ Bindings: Env }>, next: Next) => {
+    const ip = c.req.header('CF-Connecting-IP') || c.req.header('X-Forwarded-For') || 'unknown';
+    const key = `rl:${ip}:${Math.floor(Date.now() / (windowSeconds * 1000))}`;
+
+    try {
+      const current = await c.env.CACHE.get(key);
+      const count = current ? parseInt(current, 10) : 0;
+
+      if (count >= maxRequests) {
+        return c.json({
+          error: 'Rate limited',
+          message: `Maximum ${maxRequests} requests per ${windowSeconds}s exceeded`,
+          retry_after: windowSeconds,
+        }, 429);
+      }
+
+      await c.env.CACHE.put(key, String(count + 1), { expirationTtl: windowSeconds * 2 });
+    } catch {
+      // If KV fails, allow request through
+    }
+
+    await next();
+  };
+}
+
+/** Input sanitization — strip HTML/script tags from string fields */
+export function sanitize(input: string): string {
+  return input
+    .replace(/<[^>]*>/g, '')
+    .replace(/[<>'"]/g, '')
+    .trim()
+    .slice(0, 1000);
+}
+
+/** Validate SSN format (XXX-XX-XXXX or XXXXXXXXX) */
+export function isValidSSN(ssn: string): boolean {
+  const cleaned = ssn.replace(/[-\s]/g, '');
+  return /^\d{9}$/.test(cleaned) && cleaned !== '000000000' && !cleaned.startsWith('9');
+}
+
+/** Validate email format */
+export function isValidEmail(email: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+/** Request logging middleware */
+export function requestLogger() {
+  return async (c: Context<{ Bindings: Env }>, next: Next) => {
+    const start = Date.now();
+    await next();
+    const duration = Date.now() - start;
+    console.log(`[${c.req.method}] ${c.req.path} → ${c.res.status} (${duration}ms)`);
+  };
+}

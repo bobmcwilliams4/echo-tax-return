@@ -243,6 +243,8 @@ export interface TaxCalculation {
     total: number;
   };
   refund_or_owed: number;
+  effective_rate?: number;
+  marginal_rate?: number;
 }
 
 export interface BracketDetail {
