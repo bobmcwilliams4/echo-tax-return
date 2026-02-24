@@ -1,0 +1,32 @@
+name = "echo-tax-return"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+[vars]
+ENVIRONMENT = "production"
+COMMANDER_EMAIL = "bmcii1976@gmail.com"
+ENGINE_RUNTIME_URL = "https://echo-engine-runtime.bmcii1976.workers.dev"
+SHARED_BRAIN_URL = "https://echo-shared-brain.bmcii1976.workers.dev"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "echo-tax-return"
+database_id = "0720791f-bc13-49c2-a75d-18ba13ffe1e3"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "9a2008e2a5db480384c1efcead779c49"
+
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "echo-prime-media"
+
+[[services]]
+binding = "ENGINE_RUNTIME"
+service = "echo-engine-runtime"
+
+[[services]]
+binding = "SHARED_BRAIN"
+service = "echo-shared-brain"
