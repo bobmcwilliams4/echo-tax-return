@@ -547,6 +547,126 @@ features.get('/supported-years', async (c) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// TAX DEADLINE CALENDAR
+// ═══════════════════════════════════════════════════════════════
+
+features.get('/tax-calendar', async (c) => {
+  const year = Number(c.req.query('year') || new Date().getFullYear());
+  const filingYear = year + 1; // deadlines for filing year X returns are in year X+1
+
+  const deadlines = [
+    { date: `${filingYear}-01-15`, event: `Q4 ${year} Estimated Tax Payment Due`, applies_to: 'self-employed' },
+    { date: `${filingYear}-01-31`, event: `W-2s and 1099s Due to Taxpayers`, applies_to: 'all' },
+    { date: `${filingYear}-02-15`, event: `Last Day to Claim Exempt from Withholding (W-4)`, applies_to: 'employees' },
+    { date: `${filingYear}-03-15`, event: `S-Corp and Partnership Returns Due (Form 1120-S/1065)`, applies_to: 'business' },
+    { date: `${filingYear}-04-15`, event: `Individual Tax Return Due (Form 1040)`, applies_to: 'all' },
+    { date: `${filingYear}-04-15`, event: `Q1 ${filingYear} Estimated Tax Payment Due`, applies_to: 'self-employed' },
+    { date: `${filingYear}-04-15`, event: `IRA/HSA Contribution Deadline for ${year}`, applies_to: 'all' },
+    { date: `${filingYear}-06-15`, event: `Q2 ${filingYear} Estimated Tax Payment Due`, applies_to: 'self-employed' },
+    { date: `${filingYear}-09-15`, event: `Q3 ${filingYear} Estimated Tax Payment Due`, applies_to: 'self-employed' },
+    { date: `${filingYear}-09-15`, event: `Extended Partnership/S-Corp Returns Due`, applies_to: 'business' },
+    { date: `${filingYear}-10-15`, event: `Extended Individual Returns Due (Form 1040)`, applies_to: 'all' },
+  ];
+
+  const now = new Date().toISOString().split('T')[0];
+  const upcoming = deadlines.filter(d => d.date >= now).slice(0, 5);
+  const nextDeadline = upcoming[0] || null;
+  const daysUntilNext = nextDeadline ? Math.ceil((new Date(nextDeadline.date).getTime() - Date.now()) / 86400000) : null;
+
+  return c.json({
+    tax_year: year,
+    filing_year: filingYear,
+    all_deadlines: deadlines,
+    upcoming: upcoming,
+    next_deadline: nextDeadline,
+    days_until_next: daysUntilNext,
+    refund_deadlines: {
+      note: 'You have 3 years from the original due date to claim a refund',
+      earliest_claimable: year >= (new Date().getFullYear() - 3) ? `Refund still available` : `EXPIRED — past 3-year window`,
+      expires: `${year + 4}-04-15`,
+    },
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// TAX TIPS (context-aware based on return data)
+// ═══════════════════════════════════════════════════════════════
+
+features.get('/:id/tips', async (c) => {
+  const returnId = c.req.param('id');
+  const ret = await c.env.DB.prepare('SELECT * FROM returns WHERE id = ?').bind(returnId).first<TaxReturn>();
+  if (!ret) return c.json({ error: 'Return not found' }, 404);
+
+  const client = await c.env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(ret.client_id).first<Client>();
+  const incomeItems = (await c.env.DB.prepare('SELECT * FROM income_items WHERE return_id = ?').bind(returnId).all<IncomeItem>()).results;
+  const deductions = (await c.env.DB.prepare('SELECT * FROM deductions WHERE return_id = ?').bind(returnId).all<Deduction>()).results;
+  const dependents = (await c.env.DB.prepare('SELECT * FROM dependents WHERE return_id = ?').bind(returnId).all<Dependent>()).results;
+
+  const tips: Array<{ category: string; tip: string; potential_savings: string; priority: 'high' | 'medium' | 'low' }> = [];
+  const filingStatus = client?.filing_status || 'single';
+  const hasBusinessIncome = incomeItems.some(i => i.category === 'business');
+  const totalIncome = ret.total_income;
+  const wages = incomeItems.filter(i => i.category === 'wages').reduce((s, i) => s + i.amount, 0);
+
+  // Retirement savings
+  if (totalIncome > 30000 && !deductions.some(d => d.category === 'ira')) {
+    const maxIRA = ret.tax_year >= 2024 ? 7000 : 6500;
+    tips.push({ category: 'Retirement', tip: `Consider contributing to a Traditional IRA (up to $${maxIRA}) to reduce AGI`, potential_savings: `Up to $${Math.round(maxIRA * 0.22)}`, priority: 'high' });
+  }
+
+  // HSA
+  if (!deductions.some(d => d.category === 'hsa')) {
+    tips.push({ category: 'Healthcare', tip: 'If you have a high-deductible health plan, maximize HSA contributions for triple tax benefit', potential_savings: 'Up to $1,100', priority: 'medium' });
+  }
+
+  // Self-employment
+  if (hasBusinessIncome) {
+    const bizIncome = incomeItems.filter(i => i.category === 'business').reduce((s, i) => s + i.amount, 0);
+    if (bizIncome > 50000) {
+      tips.push({ category: 'Self-Employment', tip: 'Consider a SEP-IRA or Solo 401(k) to shelter up to 25% of net self-employment income', potential_savings: `Up to $${Math.round(Math.min(bizIncome * 0.25, 69000))}`, priority: 'high' });
+    }
+    tips.push({ category: 'Self-Employment', tip: 'Track home office expenses (simplified: $5/sqft up to 300 sqft = $1,500 deduction)', potential_savings: 'Up to $330', priority: 'medium' });
+  }
+
+  // Charitable
+  if (!deductions.some(d => d.category === 'charitable') && totalIncome > 50000) {
+    tips.push({ category: 'Charitable', tip: 'Donate appreciated stock instead of cash to avoid capital gains AND get a deduction', potential_savings: 'Varies', priority: 'medium' });
+  }
+
+  // Filing status
+  if (filingStatus === 'single' && dependents.length > 0) {
+    tips.push({ category: 'Filing Status', tip: 'You may qualify for Head of Household status, which has a larger standard deduction and lower tax brackets', potential_savings: 'Up to $2,000+', priority: 'high' });
+  }
+
+  // Education
+  if (dependents.some(d => {
+    if (!d.dob) return false;
+    const age = new Date().getFullYear() - new Date(d.dob).getFullYear();
+    return age >= 17 && age <= 24;
+  })) {
+    tips.push({ category: 'Education', tip: 'Claim American Opportunity Credit ($2,500/student) or Lifetime Learning Credit for college expenses', potential_savings: 'Up to $2,500', priority: 'high' });
+  }
+
+  // Energy credits
+  tips.push({ category: 'Energy', tip: 'Solar panels, EVs, and energy-efficient home improvements qualify for substantial tax credits', potential_savings: 'Up to $7,500 (EV)', priority: 'low' });
+
+  // Estimated payments
+  if (ret.refund_or_owed < -1000) {
+    tips.push({ category: 'Planning', tip: 'Consider making estimated quarterly payments to avoid underpayment penalty next year', potential_savings: 'Avoid penalty', priority: 'high' });
+  }
+
+  return c.json({
+    return_id: returnId,
+    tax_year: ret.tax_year,
+    tips_count: tips.length,
+    tips: tips.sort((a, b) => {
+      const p = { high: 0, medium: 1, low: 2 };
+      return p[a.priority] - p[b.priority];
+    }),
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
 // HELPERS
 // ═══════════════════════════════════════════════════════════════
 
