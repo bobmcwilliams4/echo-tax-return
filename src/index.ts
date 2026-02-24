@@ -55,9 +55,9 @@ app.get('/health', async (c) => {
   return c.json({
     status: 'healthy',
     service: 'echo-tax-return',
-    version: '2.3.0',
+    version: '2.5.0',
     timestamp: new Date().toISOString(),
-    features: ['multi-year', 'what-if', 'audit-risk', 'amendments', 'penalty-calc', 'notes', 'engagement-letter', 'export', 'income-projector', 'tax-calendar', 'tax-tips', 'withholding-estimator'],
+    features: ['multi-year', 'what-if', 'audit-risk', 'amendments', 'penalty-calc', 'notes', 'engagement-letter', 'export', 'income-projector', 'tax-calendar', 'tax-tips', 'withholding-estimator', 'batch-calculate', 'return-diff', 'document-checklist', 'bracket-analysis', 'return-locking', 'client-portal', 'deduction-maximizer'],
     database: dbCheck ? 'connected' : 'error',
     clients: dbCheck?.cnt || 0,
   });
@@ -84,7 +84,7 @@ app.get('/pricing', async (c) => {
 app.get('/docs', (c) => {
   return c.json({
     service: 'echo-tax-return',
-    version: '2.3.0',
+    version: '2.5.0',
     preparer: 'Bobby Don McWilliams II',
     base_url: 'https://echo-tax-return.bmcii1976.workers.dev',
     auth: { header: 'X-Echo-API-Key', alt: 'Authorization: Bearer <key>' },
@@ -153,6 +153,21 @@ app.get('/docs', (c) => {
         { method: 'GET', path: '/returns/:id/engagement-letter', description: 'Generate engagement letter' },
         { method: 'GET', path: '/returns/:id/export?format=json|csv', description: 'Export return data' },
         { method: 'POST', path: '/returns/:id/project', description: 'Income/tax projector (multi-year forward)' },
+        { method: 'POST', path: '/returns/:id/duplicate', description: 'Duplicate return to new tax year' },
+        { method: 'GET', path: '/returns/activity/:clientId', description: 'Client activity log' },
+        { method: 'GET', path: '/returns/tax-reference/:topic', description: 'Tax law quick reference' },
+        { method: 'GET', path: '/returns/:id/health', description: 'Return completeness health check' },
+      ],
+      advanced: [
+        { method: 'POST', path: '/returns/batch-calculate', description: 'Batch calculate all returns for client' },
+        { method: 'GET', path: '/returns/diff?return_a=X&return_b=Y', description: 'Side-by-side return comparison' },
+        { method: 'GET', path: '/returns/:id/document-checklist', description: 'Required documents checklist' },
+        { method: 'GET', path: '/returns/:id/bracket-analysis', description: 'Marginal rate & bracket breakdown' },
+        { method: 'POST', path: '/returns/:id/lock', description: 'Lock/unlock return for editing' },
+        { method: 'GET', path: '/returns/:id/lock-status', description: 'Check return lock status' },
+        { method: 'POST', path: '/returns/portal-token', description: 'Generate client portal access token' },
+        { method: 'GET', path: '/returns/portal/:token', description: 'Client portal read-only view' },
+        { method: 'GET', path: '/returns/:id/deduction-opportunities', description: 'Find unclaimed deduction opportunities' },
       ],
       billing: [
         { method: 'POST', path: '/billing/checkout', description: 'Create Stripe checkout session' },

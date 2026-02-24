@@ -1516,6 +1516,478 @@ features.get('/:id/health', async (c) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// BATCH CALCULATE ALL RETURNS FOR A CLIENT
+// ═══════════════════════════════════════════════════════════════
+
+features.post('/batch-calculate', async (c) => {
+  const body = await c.req.json<{ client_id: string }>();
+  if (!body.client_id) return c.json({ error: 'client_id required' }, 400);
+
+  const returns = (await c.env.DB.prepare(
+    'SELECT id, tax_year, status FROM returns WHERE client_id = ? ORDER BY tax_year'
+  ).bind(body.client_id).all()).results;
+
+  if (returns.length === 0) return c.json({ error: 'No returns found' }, 404);
+
+  const results: Array<{ return_id: string; tax_year: number; success: boolean; refund_or_owed?: number; error?: string }> = [];
+
+  for (const r of returns) {
+    const ret = r as any;
+    try {
+      const calc = await calculateTaxReturn(c.env, ret.id);
+      await c.env.CACHE.put(`calc:${ret.id}`, JSON.stringify(calc), { expirationTtl: 3600 });
+      results.push({ return_id: ret.id, tax_year: ret.tax_year, success: true, refund_or_owed: calc.refund_or_owed });
+    } catch (err) {
+      results.push({ return_id: ret.id, tax_year: ret.tax_year, success: false, error: String(err) });
+    }
+  }
+
+  return c.json({
+    client_id: body.client_id,
+    total: returns.length,
+    calculated: results.filter(r => r.success).length,
+    failed: results.filter(r => !r.success).length,
+    results,
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// RETURN COMPARISON / DIFF (two specific returns)
+// ═══════════════════════════════════════════════════════════════
+
+features.get('/diff', async (c) => {
+  const returnA = c.req.query('return_a');
+  const returnB = c.req.query('return_b');
+  if (!returnA || !returnB) return c.json({ error: 'return_a and return_b query params required' }, 400);
+
+  const [retA, retB] = await Promise.all([
+    c.env.DB.prepare('SELECT * FROM returns WHERE id = ?').bind(returnA).first<TaxReturn>(),
+    c.env.DB.prepare('SELECT * FROM returns WHERE id = ?').bind(returnB).first<TaxReturn>(),
+  ]);
+  if (!retA) return c.json({ error: `Return ${returnA} not found` }, 404);
+  if (!retB) return c.json({ error: `Return ${returnB} not found` }, 404);
+
+  const [incA, incB, dedA, dedB, depA, depB] = await Promise.all([
+    c.env.DB.prepare('SELECT category, SUM(amount) as total FROM income_items WHERE return_id = ? GROUP BY category').bind(returnA).all(),
+    c.env.DB.prepare('SELECT category, SUM(amount) as total FROM income_items WHERE return_id = ? GROUP BY category').bind(returnB).all(),
+    c.env.DB.prepare('SELECT category, SUM(amount) as total FROM deductions WHERE return_id = ? GROUP BY category').bind(returnA).all(),
+    c.env.DB.prepare('SELECT category, SUM(amount) as total FROM deductions WHERE return_id = ? GROUP BY category').bind(returnB).all(),
+    c.env.DB.prepare('SELECT COUNT(*) as cnt FROM dependents WHERE return_id = ?').bind(returnA).first<{ cnt: number }>(),
+    c.env.DB.prepare('SELECT COUNT(*) as cnt FROM dependents WHERE return_id = ?').bind(returnB).first<{ cnt: number }>(),
+  ]);
+
+  const toMap = (rows: any[]) => Object.fromEntries(rows.map((r: any) => [r.category, r.total]));
+  const incomeA = toMap(incA.results);
+  const incomeB = toMap(incB.results);
+  const deductionsA = toMap(dedA.results);
+  const deductionsB = toMap(dedB.results);
+
+  const allIncCats = [...new Set([...Object.keys(incomeA), ...Object.keys(incomeB)])];
+  const allDedCats = [...new Set([...Object.keys(deductionsA), ...Object.keys(deductionsB)])];
+
+  const incomeDiff = allIncCats.map(cat => ({
+    category: cat,
+    return_a: incomeA[cat] || 0,
+    return_b: incomeB[cat] || 0,
+    change: (incomeB[cat] || 0) - (incomeA[cat] || 0),
+    change_pct: incomeA[cat] ? Math.round(((incomeB[cat] || 0) - incomeA[cat]) / incomeA[cat] * 10000) / 100 : null,
+  }));
+
+  const deductionDiff = allDedCats.map(cat => ({
+    category: cat,
+    return_a: deductionsA[cat] || 0,
+    return_b: deductionsB[cat] || 0,
+    change: (deductionsB[cat] || 0) - (deductionsA[cat] || 0),
+  }));
+
+  return c.json({
+    return_a: { id: retA.id, tax_year: retA.tax_year, income: retA.total_income, tax: retA.total_tax, refund: retA.refund_or_owed, dependents: depA?.cnt || 0 },
+    return_b: { id: retB.id, tax_year: retB.tax_year, income: retB.total_income, tax: retB.total_tax, refund: retB.refund_or_owed, dependents: depB?.cnt || 0 },
+    summary: {
+      income_change: retB.total_income - retA.total_income,
+      tax_change: retB.total_tax - retA.total_tax,
+      refund_change: retB.refund_or_owed - retA.refund_or_owed,
+      agi_change: retB.adjusted_gross_income - retA.adjusted_gross_income,
+      deduction_method_change: retA.deduction_method !== retB.deduction_method ? `${retA.deduction_method} → ${retB.deduction_method}` : 'unchanged',
+    },
+    income_breakdown: incomeDiff,
+    deduction_breakdown: deductionDiff,
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// DOCUMENT CHECKLIST (what docs needed based on income types)
+// ═══════════════════════════════════════════════════════════════
+
+features.get('/:id/document-checklist', async (c) => {
+  const returnId = c.req.param('id');
+
+  const ret = await c.env.DB.prepare('SELECT * FROM returns WHERE id = ?').bind(returnId).first<TaxReturn>();
+  if (!ret) return c.json({ error: 'Return not found' }, 404);
+
+  const [incomeResult, deductionResult, dependentResult, docsResult] = await Promise.all([
+    c.env.DB.prepare('SELECT * FROM income_items WHERE return_id = ?').bind(returnId).all(),
+    c.env.DB.prepare('SELECT * FROM deductions WHERE return_id = ?').bind(returnId).all(),
+    c.env.DB.prepare('SELECT * FROM dependents WHERE return_id = ?').bind(returnId).all(),
+    c.env.DB.prepare('SELECT doc_type FROM documents WHERE return_id = ?').bind(returnId).all(),
+  ]);
+
+  const uploadedTypes = new Set(docsResult.results.map((d: any) => d.doc_type));
+  const checklist: Array<{ document: string; form: string; needed: boolean; uploaded: boolean; reason: string; priority: 'required' | 'recommended' | 'optional' }> = [];
+
+  // Always needed
+  checklist.push({ document: 'Prior Year Tax Return', form: 'Form 1040', needed: true, uploaded: uploadedTypes.has('prior_return'), reason: 'For comparison and safe harbor calculations', priority: 'recommended' });
+  checklist.push({ document: 'Photo ID', form: 'Government ID', needed: true, uploaded: uploadedTypes.has('photo_id'), reason: 'Identity verification for e-filing', priority: 'required' });
+
+  // Income-based
+  const cats = new Set(incomeResult.results.map((i: any) => i.category));
+  if (cats.has('wages')) {
+    checklist.push({ document: 'W-2 (all employers)', form: 'W-2', needed: true, uploaded: uploadedTypes.has('w2'), reason: 'Wage income reported to IRS', priority: 'required' });
+  }
+  if (cats.has('interest')) {
+    checklist.push({ document: '1099-INT', form: '1099-INT', needed: true, uploaded: uploadedTypes.has('1099_int'), reason: 'Bank/savings interest income', priority: 'required' });
+  }
+  if (cats.has('dividends')) {
+    checklist.push({ document: '1099-DIV', form: '1099-DIV', needed: true, uploaded: uploadedTypes.has('1099_div'), reason: 'Stock/fund dividend income', priority: 'required' });
+  }
+  if (cats.has('business')) {
+    checklist.push({ document: '1099-NEC / 1099-MISC', form: '1099-NEC', needed: true, uploaded: uploadedTypes.has('1099_nec'), reason: 'Self-employment / freelance income', priority: 'required' });
+    checklist.push({ document: 'Business Expense Records', form: 'Schedule C', needed: true, uploaded: uploadedTypes.has('expense_records'), reason: 'Business deductions require substantiation', priority: 'required' });
+    checklist.push({ document: 'Business Mileage Log', form: 'Schedule C', needed: true, uploaded: uploadedTypes.has('mileage_log'), reason: 'Vehicle expense deduction (67 cents/mile 2024)', priority: 'recommended' });
+    checklist.push({ document: 'Home Office Measurements', form: 'Form 8829', needed: true, uploaded: uploadedTypes.has('home_office'), reason: 'Home office deduction ($5/sqft, max 300 sqft)', priority: 'recommended' });
+  }
+  if (cats.has('capital_gains')) {
+    checklist.push({ document: '1099-B (Brokerage)', form: '1099-B', needed: true, uploaded: uploadedTypes.has('1099_b'), reason: 'Stock/crypto/property sales', priority: 'required' });
+  }
+  if (cats.has('rental')) {
+    checklist.push({ document: 'Rental Income Records', form: 'Schedule E', needed: true, uploaded: uploadedTypes.has('rental_income'), reason: 'Rent received, tenant info', priority: 'required' });
+    checklist.push({ document: 'Rental Expense Records', form: 'Schedule E', needed: true, uploaded: uploadedTypes.has('rental_expenses'), reason: 'Repairs, insurance, property taxes, depreciation', priority: 'required' });
+  }
+  if (cats.has('retirement')) {
+    checklist.push({ document: '1099-R', form: '1099-R', needed: true, uploaded: uploadedTypes.has('1099_r'), reason: 'Pension/IRA/401k distributions', priority: 'required' });
+  }
+
+  // Deduction-based
+  const dedCats = new Set(deductionResult.results.map((d: any) => d.category));
+  if (dedCats.has('mortgage_interest')) {
+    checklist.push({ document: 'Mortgage Interest Statement', form: 'Form 1098', needed: true, uploaded: uploadedTypes.has('1098'), reason: 'Mortgage interest deduction', priority: 'required' });
+  }
+  if (dedCats.has('charitable')) {
+    checklist.push({ document: 'Charitable Donation Receipts', form: 'Schedule A', needed: true, uploaded: uploadedTypes.has('charitable_receipts'), reason: 'Donations >$250 need written acknowledgment', priority: 'required' });
+  }
+  if (dedCats.has('medical')) {
+    checklist.push({ document: 'Medical Expense Records', form: 'Schedule A', needed: true, uploaded: uploadedTypes.has('medical_records'), reason: 'Medical expenses over 7.5% of AGI', priority: 'required' });
+  }
+  if (dedCats.has('student_loan')) {
+    checklist.push({ document: 'Student Loan Interest', form: 'Form 1098-E', needed: true, uploaded: uploadedTypes.has('1098_e'), reason: 'Up to $2,500 student loan interest deduction', priority: 'required' });
+  }
+
+  // Dependent-based
+  if (dependentResult.results.length > 0) {
+    checklist.push({ document: 'Dependent SSN/Birth Certificate', form: 'Schedule 8812', needed: true, uploaded: uploadedTypes.has('dependent_ssn'), reason: 'Required for Child Tax Credit', priority: 'required' });
+    checklist.push({ document: 'Childcare Expense Records', form: 'Form 2441', needed: false, uploaded: uploadedTypes.has('childcare'), reason: 'Child/dependent care credit (if applicable)', priority: 'optional' });
+  }
+
+  const needed = checklist.filter(c => c.needed);
+  const uploaded = checklist.filter(c => c.uploaded);
+  const missing = needed.filter(c => !c.uploaded);
+
+  return c.json({
+    return_id: returnId,
+    tax_year: ret.tax_year,
+    completeness: needed.length > 0 ? Math.round((uploaded.length / needed.length) * 100) : 100,
+    total_needed: needed.length,
+    total_uploaded: uploaded.length,
+    missing_count: missing.length,
+    checklist: checklist.sort((a, b) => {
+      const p = { required: 0, recommended: 1, optional: 2 };
+      return p[a.priority] - p[b.priority];
+    }),
+    missing_required: missing.filter(c => c.priority === 'required'),
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// MARGINAL RATE ANALYSIS / TAX BRACKET BREAKDOWN
+// ═══════════════════════════════════════════════════════════════
+
+features.get('/:id/bracket-analysis', async (c) => {
+  const returnId = c.req.param('id');
+
+  const ret = await c.env.DB.prepare('SELECT * FROM returns WHERE id = ?').bind(returnId).first<TaxReturn>();
+  if (!ret) return c.json({ error: 'Return not found' }, 404);
+
+  const client = await c.env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(ret.client_id).first<Client>();
+  const filingStatus: FilingStatus = (client?.filing_status as FilingStatus) || 'single';
+  const brackets = getTaxBrackets(ret.tax_year, filingStatus);
+  const taxableIncome = ret.taxable_income || 0;
+
+  let remaining = taxableIncome;
+  let totalTax = 0;
+  const breakdown: Array<{
+    rate: number;
+    rate_pct: string;
+    bracket_min: number;
+    bracket_max: number;
+    taxable_in_bracket: number;
+    tax_in_bracket: number;
+    cumulative_tax: number;
+    effective_rate_at_bracket: number;
+  }> = [];
+
+  for (const bracket of brackets) {
+    if (remaining <= 0) {
+      breakdown.push({
+        rate: bracket.rate,
+        rate_pct: `${Math.round(bracket.rate * 100)}%`,
+        bracket_min: bracket.min,
+        bracket_max: bracket.max === Infinity ? bracket.min + 1000000 : bracket.max,
+        taxable_in_bracket: 0,
+        tax_in_bracket: 0,
+        cumulative_tax: totalTax,
+        effective_rate_at_bracket: 0,
+      });
+      continue;
+    }
+    const width = bracket.max === Infinity ? remaining : bracket.max - bracket.min;
+    const taxable = Math.min(remaining, width);
+    const tax = Math.round(taxable * bracket.rate * 100) / 100;
+    totalTax += tax;
+    remaining -= taxable;
+
+    breakdown.push({
+      rate: bracket.rate,
+      rate_pct: `${Math.round(bracket.rate * 100)}%`,
+      bracket_min: bracket.min,
+      bracket_max: bracket.max === Infinity ? bracket.min + 1000000 : bracket.max,
+      taxable_in_bracket: Math.round(taxable * 100) / 100,
+      tax_in_bracket: tax,
+      cumulative_tax: Math.round(totalTax * 100) / 100,
+      effective_rate_at_bracket: taxableIncome > 0 ? Math.round((totalTax / taxableIncome) * 10000) / 100 : 0,
+    });
+  }
+
+  // Find current marginal bracket
+  const currentBracket = breakdown.find(b => b.taxable_in_bracket > 0 && b.taxable_in_bracket < (b.bracket_max - b.bracket_min)) || breakdown[breakdown.length - 1];
+  const effectiveRate = taxableIncome > 0 ? Math.round((totalTax / taxableIncome) * 10000) / 100 : 0;
+
+  // Calculate next dollar analysis
+  const nextDollarRate = currentBracket?.rate || 0;
+  const roomInBracket = currentBracket ? (currentBracket.bracket_max - currentBracket.bracket_min) - currentBracket.taxable_in_bracket : 0;
+
+  return c.json({
+    return_id: returnId,
+    tax_year: ret.tax_year,
+    filing_status: filingStatus,
+    taxable_income: taxableIncome,
+    total_tax: Math.round(totalTax * 100) / 100,
+    effective_rate: effectiveRate,
+    marginal_rate: Math.round(nextDollarRate * 100),
+    rate_spread: Math.round((nextDollarRate * 100) - effectiveRate * 100) / 100,
+    room_in_current_bracket: Math.round(roomInBracket * 100) / 100,
+    next_bracket_starts_at: currentBracket ? currentBracket.bracket_max : 0,
+    bracket_breakdown: breakdown,
+    insights: [
+      `Your effective tax rate is ${effectiveRate}% — you pay $${effectiveRate.toFixed(0)} per $1,000 of taxable income on average`,
+      `Your marginal rate is ${Math.round(nextDollarRate * 100)}% — each additional dollar earned is taxed at this rate`,
+      roomInBracket > 0 ? `You can earn $${Math.round(roomInBracket).toLocaleString()} more before hitting the next bracket` : 'You are at the top of your current bracket',
+      `The spread between marginal and effective rate is ${Math.round((nextDollarRate * 100) - effectiveRate * 100) / 100} percentage points`,
+    ],
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// RETURN LOCKING (prevent edits to filed returns)
+// ═══════════════════════════════════════════════════════════════
+
+features.post('/:id/lock', async (c) => {
+  const returnId = c.req.param('id');
+  const body = await c.req.json<{ action: 'lock' | 'unlock'; reason?: string }>().catch(() => ({ action: 'lock' as const }));
+
+  const ret = await c.env.DB.prepare('SELECT * FROM returns WHERE id = ?').bind(returnId).first<TaxReturn>();
+  if (!ret) return c.json({ error: 'Return not found' }, 404);
+
+  // Ensure lock tracking table
+  await c.env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS return_locks (
+      return_id TEXT PRIMARY KEY,
+      locked INTEGER DEFAULT 0,
+      locked_by TEXT,
+      locked_at TEXT,
+      reason TEXT
+    )
+  `).run();
+
+  if (body.action === 'lock') {
+    await c.env.DB.prepare(
+      `INSERT OR REPLACE INTO return_locks (return_id, locked, locked_by, locked_at, reason) VALUES (?, 1, 'preparer', datetime('now'), ?)`
+    ).bind(returnId, body.reason || 'Return filed — locked for integrity').run();
+    return c.json({ return_id: returnId, locked: true, message: 'Return locked. Edits are now prevented.' });
+  } else {
+    await c.env.DB.prepare('DELETE FROM return_locks WHERE return_id = ?').bind(returnId).run();
+    return c.json({ return_id: returnId, locked: false, message: 'Return unlocked. Edits are now allowed.' });
+  }
+});
+
+features.get('/:id/lock-status', async (c) => {
+  const returnId = c.req.param('id');
+  try {
+    const lock = await c.env.DB.prepare('SELECT * FROM return_locks WHERE return_id = ? AND locked = 1').bind(returnId).first();
+    return c.json({ return_id: returnId, locked: !!lock, details: lock || null });
+  } catch {
+    return c.json({ return_id: returnId, locked: false, details: null });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// CLIENT PORTAL TOKEN (shareable read-only access)
+// ═══════════════════════════════════════════════════════════════
+
+features.post('/portal-token', async (c) => {
+  const body = await c.req.json<{ client_id: string; expires_hours?: number }>();
+  if (!body.client_id) return c.json({ error: 'client_id required' }, 400);
+
+  const client = await c.env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(body.client_id).first<Client>();
+  if (!client) return c.json({ error: 'Client not found' }, 404);
+
+  // Generate a simple token (in production, use JWT)
+  const token = generateId('portal') + '-' + Date.now().toString(36);
+  const expiresHours = body.expires_hours || 72;
+  const expiresAt = new Date(Date.now() + expiresHours * 3600000).toISOString();
+
+  // Store token in KV with expiration
+  await c.env.CACHE.put(`portal:${token}`, JSON.stringify({
+    client_id: body.client_id,
+    client_name: `${client.first_name} ${client.last_name}`,
+    created_at: new Date().toISOString(),
+    expires_at: expiresAt,
+    access: 'read_only',
+  }), { expirationTtl: expiresHours * 3600 });
+
+  return c.json({
+    token,
+    client_id: body.client_id,
+    access: 'read_only',
+    expires_at: expiresAt,
+    portal_url: `https://echo-lgt.com/portal?token=${token}`,
+    note: 'Share this link with the client to view their return status (read-only)',
+  });
+});
+
+features.get('/portal/:token', async (c) => {
+  const token = c.req.param('token');
+  const data = await c.env.CACHE.get(`portal:${token}`);
+  if (!data) return c.json({ error: 'Invalid or expired portal token' }, 401);
+
+  const portal = JSON.parse(data);
+  const returns = (await c.env.DB.prepare(
+    'SELECT id, tax_year, status, total_income, refund_or_owed, filed_at FROM returns WHERE client_id = ? ORDER BY tax_year DESC'
+  ).bind(portal.client_id).all()).results;
+
+  return c.json({
+    client_name: portal.client_name,
+    access: 'read_only',
+    expires_at: portal.expires_at,
+    returns: returns.map((r: any) => ({
+      tax_year: r.tax_year,
+      status: r.status,
+      result: r.refund_or_owed >= 0 ? 'REFUND' : 'OWED',
+      amount: Math.abs(r.refund_or_owed),
+      filed: r.filed_at || 'Not yet filed',
+    })),
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// DEDUCTION MAXIMIZER (find unused deduction opportunities)
+// ═══════════════════════════════════════════════════════════════
+
+features.get('/:id/deduction-opportunities', async (c) => {
+  const returnId = c.req.param('id');
+
+  const ret = await c.env.DB.prepare('SELECT * FROM returns WHERE id = ?').bind(returnId).first<TaxReturn>();
+  if (!ret) return c.json({ error: 'Return not found' }, 404);
+
+  const client = await c.env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(ret.client_id).first<Client>();
+  const [incomeResult, deductionResult, dependentResult] = await Promise.all([
+    c.env.DB.prepare('SELECT * FROM income_items WHERE return_id = ?').bind(returnId).all(),
+    c.env.DB.prepare('SELECT * FROM deductions WHERE return_id = ?').bind(returnId).all(),
+    c.env.DB.prepare('SELECT * FROM dependents WHERE return_id = ?').bind(returnId).all(),
+  ]);
+
+  const currentDedCats = new Set(deductionResult.results.map((d: any) => d.category));
+  const hasBusinessIncome = incomeResult.results.some((i: any) => i.category === 'business');
+  const hasDependents = dependentResult.results.length > 0;
+  const filingStatus = client?.filing_status || 'single';
+  const agi = ret.adjusted_gross_income || 0;
+  const standardDed = getStandardDeduction(ret.tax_year, filingStatus as FilingStatus);
+  const currentItemized = deductionResult.results.reduce((s: number, d: any) => s + (d.amount || 0), 0);
+
+  const opportunities: Array<{ deduction: string; category: string; max_amount: number; estimated_savings: number; requirements: string; irc_section: string; already_claimed: boolean }> = [];
+
+  // Marginal rate for savings calculation
+  const brackets = getTaxBrackets(ret.tax_year, filingStatus as FilingStatus);
+  let marginalRate = 0.22;
+  let remaining = ret.taxable_income || 0;
+  for (const b of brackets) {
+    const w = b.max - b.min;
+    if (remaining <= w) { marginalRate = b.rate; break; }
+    remaining -= w;
+  }
+
+  if (!currentDedCats.has('ira')) {
+    const max = ret.tax_year >= 2024 ? 7000 : 6500;
+    opportunities.push({ deduction: 'Traditional IRA Contribution', category: 'ira', max_amount: max, estimated_savings: Math.round(max * marginalRate), requirements: 'Must have earned income; AGI limits apply if covered by employer plan', irc_section: 'IRC 219', already_claimed: false });
+  }
+  if (!currentDedCats.has('hsa')) {
+    const max = filingStatus === 'married_joint' ? 8300 : 4150;
+    opportunities.push({ deduction: 'HSA Contribution', category: 'hsa', max_amount: max, estimated_savings: Math.round(max * marginalRate), requirements: 'Must have HDHP coverage; not enrolled in Medicare', irc_section: 'IRC 223', already_claimed: false });
+  }
+  if (!currentDedCats.has('student_loan') && agi < 90000) {
+    opportunities.push({ deduction: 'Student Loan Interest', category: 'student_loan', max_amount: 2500, estimated_savings: Math.round(2500 * marginalRate), requirements: 'Paid interest on qualified student loan; AGI under $90K single/$185K MFJ', irc_section: 'IRC 221', already_claimed: false });
+  }
+  if (!currentDedCats.has('educator') && incomeResult.results.some((i: any) => i.category === 'wages')) {
+    opportunities.push({ deduction: 'Educator Expense', category: 'educator', max_amount: 300, estimated_savings: Math.round(300 * marginalRate), requirements: 'K-12 teacher, instructor, counselor, or principal for 900+ hours', irc_section: 'IRC 62(a)(2)(D)', already_claimed: false });
+  }
+  if (hasBusinessIncome && !currentDedCats.has('sep_ira')) {
+    const bizIncome = incomeResult.results.filter((i: any) => i.category === 'business').reduce((s: number, i: any) => s + i.amount, 0);
+    const maxSep = Math.min(Math.round(bizIncome * 0.25), 69000);
+    opportunities.push({ deduction: 'SEP-IRA (Self-Employed)', category: 'sep_ira', max_amount: maxSep, estimated_savings: Math.round(maxSep * marginalRate), requirements: 'Self-employed with net earnings; up to 25% of net SE income', irc_section: 'IRC 408(k)', already_claimed: false });
+  }
+  if (hasBusinessIncome && !currentDedCats.has('home_office')) {
+    opportunities.push({ deduction: 'Home Office (Simplified)', category: 'home_office', max_amount: 1500, estimated_savings: Math.round(1500 * marginalRate), requirements: 'Regular and exclusive business use of home space', irc_section: 'IRC 280A', already_claimed: false });
+  }
+  if (!currentDedCats.has('charitable') && currentItemized > standardDed * 0.7) {
+    opportunities.push({ deduction: 'Charitable Donations', category: 'charitable', max_amount: Math.round(agi * 0.6), estimated_savings: Math.round(5000 * marginalRate), requirements: 'Donations to qualified 501(c)(3) orgs; up to 60% of AGI', irc_section: 'IRC 170', already_claimed: false });
+  }
+  if (!currentDedCats.has('salt') && currentItemized > standardDed * 0.5) {
+    opportunities.push({ deduction: 'State/Local Tax (SALT)', category: 'salt', max_amount: 10000, estimated_savings: Math.round(10000 * marginalRate), requirements: 'Capped at $10,000 ($5,000 MFS); property + income/sales tax', irc_section: 'IRC 164', already_claimed: false });
+  }
+
+  // Mark already claimed
+  for (const opp of opportunities) {
+    opp.already_claimed = currentDedCats.has(opp.category);
+  }
+
+  const unclaimed = opportunities.filter(o => !o.already_claimed);
+  const totalPotentialSavings = unclaimed.reduce((s, o) => s + o.estimated_savings, 0);
+
+  return c.json({
+    return_id: returnId,
+    tax_year: ret.tax_year,
+    marginal_rate: Math.round(marginalRate * 100),
+    current_deduction_method: ret.deduction_method,
+    standard_deduction: standardDed,
+    current_itemized: currentItemized,
+    itemize_recommended: currentItemized + unclaimed.reduce((s, o) => s + o.max_amount * 0.5, 0) > standardDed,
+    opportunities_count: unclaimed.length,
+    total_potential_savings: totalPotentialSavings,
+    opportunities: unclaimed.sort((a, b) => b.estimated_savings - a.estimated_savings),
+    already_claimed: opportunities.filter(o => o.already_claimed),
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
 // HELPERS
 // ═══════════════════════════════════════════════════════════════
 
