@@ -2,11 +2,156 @@
 // Estimated payments, multi-year comparison, audit risk, amendments, withholding estimator
 import { Hono } from 'hono';
 import type { Env, TaxReturn, Client, IncomeItem, Deduction, Dependent, FilingStatus } from './types';
-import { isCommander, generateId, requireAuth } from './auth';
+import { isCommander, generateId, requireAuth, logAudit } from './auth';
 import { calculateTaxReturn } from './calculator';
 import { getTaxBrackets, getStandardDeduction, getSSWageBase, getCTCParams, getSupportedYears } from './tax-data';
 
 const features = new Hono<{ Bindings: Env }>();
+
+// ═══════════════════════════════════════════════════════════════
+// AUDIT LOG ENDPOINTS (Commander only — static routes FIRST)
+// ═══════════════════════════════════════════════════════════════
+
+/** GET /audit-log — List audit entries with pagination and filters */
+features.get('/audit-log', async (c) => {
+  if (!isCommander(c)) return c.json({ error: 'Commander access required' }, 403);
+
+  const page = Math.max(1, parseInt(c.req.query('page') || '1', 10));
+  const limit = Math.min(200, Math.max(1, parseInt(c.req.query('limit') || '50', 10)));
+  const offset = (page - 1) * limit;
+  const actionFilter = c.req.query('action') || null;
+  const severityFilter = c.req.query('severity') || null;
+  const userFilter = c.req.query('user_id') || null;
+
+  let whereClause = '1=1';
+  const params: any[] = [];
+
+  if (actionFilter) {
+    whereClause += ' AND action LIKE ?';
+    params.push(`%${actionFilter}%`);
+  }
+  if (severityFilter) {
+    whereClause += ' AND severity = ?';
+    params.push(severityFilter);
+  }
+  if (userFilter) {
+    whereClause += ' AND user_id = ?';
+    params.push(userFilter);
+  }
+
+  const countSql = `SELECT COUNT(*) as total FROM audit_log WHERE ${whereClause}`;
+  const dataSql = `SELECT * FROM audit_log WHERE ${whereClause} ORDER BY timestamp DESC LIMIT ? OFFSET ?`;
+
+  const [countResult, dataResult] = await Promise.all([
+    params.length > 0
+      ? c.env.DB.prepare(countSql).bind(...params).first<{ total: number }>()
+      : c.env.DB.prepare(countSql).first<{ total: number }>(),
+    c.env.DB.prepare(dataSql).bind(...params, limit, offset).all(),
+  ]);
+
+  const total = countResult?.total || 0;
+
+  await logAudit(c.env, 'VIEW_AUDIT_LOG', 'audit_log', null,
+    `page=${page} limit=${limit} filters=${JSON.stringify({ action: actionFilter, severity: severityFilter, user_id: userFilter })}`,
+    c.req.header('X-Commander-Email') || null,
+    c.req.header('CF-Connecting-IP') || null,
+    c.req.header('User-Agent') || null,
+    'info');
+
+  return c.json({
+    audit_log: dataResult.results,
+    pagination: {
+      page,
+      limit,
+      total,
+      total_pages: Math.ceil(total / limit),
+      has_next: page * limit < total,
+      has_prev: page > 1,
+    },
+    filters: { action: actionFilter, severity: severityFilter, user_id: userFilter },
+  });
+});
+
+/** GET /audit-log/export — Export full audit log as JSON */
+features.get('/audit-log/export', async (c) => {
+  if (!isCommander(c)) return c.json({ error: 'Commander access required' }, 403);
+
+  const fromDate = c.req.query('from') || null;
+  const toDate = c.req.query('to') || null;
+
+  let sql = 'SELECT * FROM audit_log';
+  const params: any[] = [];
+
+  if (fromDate && toDate) {
+    sql += ' WHERE timestamp >= ? AND timestamp <= ?';
+    params.push(fromDate, toDate);
+  } else if (fromDate) {
+    sql += ' WHERE timestamp >= ?';
+    params.push(fromDate);
+  } else if (toDate) {
+    sql += ' WHERE timestamp <= ?';
+    params.push(toDate);
+  }
+
+  sql += ' ORDER BY timestamp DESC';
+
+  const result = params.length > 0
+    ? await c.env.DB.prepare(sql).bind(...params).all()
+    : await c.env.DB.prepare(sql).all();
+
+  await logAudit(c.env, 'EXPORT_AUDIT_LOG', 'audit_log', null,
+    `rows=${result.results.length} from=${fromDate} to=${toDate}`,
+    c.req.header('X-Commander-Email') || null,
+    c.req.header('CF-Connecting-IP') || null,
+    c.req.header('User-Agent') || null,
+    'warn');
+
+  return c.json({
+    export: {
+      generated_at: new Date().toISOString(),
+      total_entries: result.results.length,
+      date_range: { from: fromDate, to: toDate },
+      entries: result.results,
+    },
+  });
+});
+
+/** GET /audit-log/stats — Audit statistics */
+features.get('/audit-log/stats', async (c) => {
+  if (!isCommander(c)) return c.json({ error: 'Commander access required' }, 403);
+
+  const [totalCount, byAction, bySeverity, topUsers, recentActivity, hourlyActivity] = await Promise.all([
+    c.env.DB.prepare('SELECT COUNT(*) as total FROM audit_log').first<{ total: number }>(),
+    c.env.DB.prepare(
+      `SELECT action, COUNT(*) as cnt FROM audit_log GROUP BY action ORDER BY cnt DESC LIMIT 20`
+    ).all(),
+    c.env.DB.prepare(
+      `SELECT severity, COUNT(*) as cnt FROM audit_log GROUP BY severity ORDER BY cnt DESC`
+    ).all(),
+    c.env.DB.prepare(
+      `SELECT user_id, COUNT(*) as cnt FROM audit_log WHERE user_id IS NOT NULL GROUP BY user_id ORDER BY cnt DESC LIMIT 10`
+    ).all(),
+    c.env.DB.prepare(
+      `SELECT id, timestamp, user_id, action, severity FROM audit_log ORDER BY timestamp DESC LIMIT 25`
+    ).all(),
+    c.env.DB.prepare(
+      `SELECT strftime('%Y-%m-%d %H:00', timestamp) as hour, COUNT(*) as cnt
+       FROM audit_log WHERE timestamp >= datetime('now', '-24 hours')
+       GROUP BY hour ORDER BY hour DESC`
+    ).all(),
+  ]);
+
+  return c.json({
+    stats: {
+      total_entries: totalCount?.total || 0,
+      by_action: byAction.results,
+      by_severity: bySeverity.results,
+      top_users: topUsers.results,
+      recent_activity: recentActivity.results,
+      hourly_last_24h: hourlyActivity.results,
+    },
+  });
+});
 
 // ═══════════════════════════════════════════════════════════════
 // ESTIMATED TAX PAYMENTS (quarterly tracking)

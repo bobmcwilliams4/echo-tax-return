@@ -4,7 +4,7 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import type { Env, TaxReturn } from './types';
-import { requireAuth, isCommander, generateId, rateLimit, requestLogger } from './auth';
+import { requireAuth, isCommander, generateId, rateLimit, requestLogger, auditMiddleware } from './auth';
 import { calculateTaxReturn, generateForm1040 } from './calculator';
 import clients from './clients';
 import returns from './returns';
@@ -13,6 +13,7 @@ import optimizer from './optimizer';
 import billing from './billing';
 import efile from './efile';
 import features from './features';
+import advanced from './advanced';
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -55,9 +56,9 @@ app.get('/health', async (c) => {
   return c.json({
     status: 'healthy',
     service: 'echo-tax-return',
-    version: '3.0.0',
+    version: '3.1.0',
     timestamp: new Date().toISOString(),
-    features: ['multi-year', 'what-if', 'audit-risk', 'amendments', 'penalty-calc', 'notes', 'engagement-letter', 'export', 'income-projector', 'tax-calendar', 'tax-tips', 'withholding-estimator', 'batch-calculate', 'return-diff', 'document-checklist', 'bracket-analysis', 'return-locking', 'client-portal', 'deduction-maximizer', 'client-summary', 'return-timeline', 'tax-knowledge-search', 'return-snapshot', 'return-validation', 'preparer-dashboard'],
+    features: ['multi-year', 'what-if', 'audit-risk', 'amendments', 'penalty-calc', 'notes', 'engagement-letter', 'export', 'income-projector', 'tax-calendar', 'tax-tips', 'withholding-estimator', 'batch-calculate', 'return-diff', 'document-checklist', 'bracket-analysis', 'return-locking', 'client-portal', 'deduction-maximizer', 'client-summary', 'return-timeline', 'tax-knowledge-search', 'return-snapshot', 'return-validation', 'preparer-dashboard', 'audit-logging', 'se-tax-calculator', 'safe-harbor-analysis', 'print-package', 'income-analysis', 'key-numbers-reference', 'communications-log'],
     database: dbCheck ? 'connected' : 'error',
     clients: dbCheck?.cnt || 0,
   });
@@ -84,7 +85,7 @@ app.get('/pricing', async (c) => {
 app.get('/docs', (c) => {
   return c.json({
     service: 'echo-tax-return',
-    version: '3.0.0',
+    version: '3.1.0',
     preparer: 'Bobby Don McWilliams II',
     base_url: 'https://echo-tax-return.bmcii1976.workers.dev',
     auth: { header: 'X-Echo-API-Key', alt: 'Authorization: Bearer <key>' },
@@ -179,6 +180,20 @@ app.get('/docs', (c) => {
         { method: 'POST', path: '/billing/checkout', description: 'Create Stripe checkout session' },
         { method: 'POST', path: '/billing/webhook', description: 'Stripe webhook handler' },
       ],
+      audit: [
+        { method: 'GET', path: '/returns/audit-log', description: 'List audit entries with pagination (Commander only)' },
+        { method: 'GET', path: '/returns/audit-log/export', description: 'Export audit log as JSON (Commander only)' },
+        { method: 'GET', path: '/returns/audit-log/stats', description: 'Audit statistics — counts by action, severity, top users (Commander only)' },
+      ],
+      professional: [
+        { method: 'GET', path: '/returns/key-numbers/:year', description: 'Tax reference data — brackets, deductions, limits, EITC, mileage' },
+        { method: 'POST', path: '/returns/communications', description: 'Log client communication (email, call, meeting)' },
+        { method: 'GET', path: '/returns/communications/:clientId', description: 'List communications for client' },
+        { method: 'GET', path: '/returns/:id/se-tax', description: 'Self-employment tax calculator (Schedule SE, quarterly estimates, retirement)' },
+        { method: 'GET', path: '/returns/:id/safe-harbor', description: 'IRS safe harbor analysis (90%/100%/110% thresholds, penalty risk)' },
+        { method: 'GET', path: '/returns/:id/print-package', description: 'Comprehensive print-ready return summary' },
+        { method: 'GET', path: '/returns/:id/income-analysis', description: 'Income source diversification & concentration risk' },
+      ],
       admin: [
         { method: 'GET', path: '/stats', description: 'Dashboard stats (Commander only)' },
       ],
@@ -195,6 +210,9 @@ app.use('/documents/*', requireAuth());
 app.use('/billing/*', requireAuth());
 app.use('/stats', requireAuth());
 
+// ─── Audit Logging (after auth, logs authenticated requests) ─
+app.use('*', auditMiddleware());
+
 // ─── Mount Route Modules ─────────────────────────────────────
 // IMPORTANT: features and efile mount BEFORE returns so static
 // paths like /supported-years, /compare, /tax-calendar, /batch-calculate
@@ -202,6 +220,7 @@ app.use('/stats', requireAuth());
 app.route('/clients', clients);
 app.route('/returns', features);
 app.route('/returns', efile);
+app.route('/returns', advanced);
 app.route('/returns', returns);
 app.route('/documents', documents);
 app.route('/billing', billing);

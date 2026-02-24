@@ -99,3 +99,47 @@ export function requestLogger() {
     console.log(`[${c.req.method}] ${c.req.path} → ${c.res.status} (${duration}ms)`);
   };
 }
+
+/** Insert an audit log entry into D1 */
+export async function logAudit(
+  env: Env,
+  action: string,
+  resourceType: string | null,
+  resourceId: string | null,
+  details: string | null,
+  userId: string | null,
+  ip: string | null,
+  ua: string | null,
+  severity: 'info' | 'warn' | 'error' | 'critical' = 'info',
+): Promise<void> {
+  try {
+    const id = generateId('aud');
+    await env.DB.prepare(
+      `INSERT INTO audit_log (id, user_id, action, resource_type, resource_id, ip_address, user_agent, details, severity)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(id, userId, action, resourceType, resourceId, ip, ua, details, severity).run();
+  } catch (err) {
+    console.error('[audit] Failed to write audit log:', err);
+  }
+}
+
+/** Audit middleware — auto-logs every authenticated request */
+export function auditMiddleware() {
+  return async (c: Context<{ Bindings: Env }>, next: Next) => {
+    await next();
+    // Only log non-health, non-docs, non-OPTIONS requests
+    const path = c.req.path;
+    if (path === '/health' || path === '/docs' || path === '/pricing' || c.req.method === 'OPTIONS') {
+      return;
+    }
+    const userId = c.req.header('X-User-Id') || c.req.header('X-Commander-Email') || null;
+    const ip = c.req.header('CF-Connecting-IP') || c.req.header('X-Forwarded-For') || null;
+    const ua = c.req.header('User-Agent') || null;
+    const action = `${c.req.method} ${path}`;
+    const severity = c.res.status >= 500 ? 'error' : c.res.status >= 400 ? 'warn' : 'info';
+    // Fire and forget — don't block response
+    c.executionCtx.waitUntil(
+      logAudit(c.env, action, null, null, `status=${c.res.status}`, userId, ip, ua, severity as any)
+    );
+  };
+}
