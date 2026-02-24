@@ -196,12 +196,15 @@ app.use('/billing/*', requireAuth());
 app.use('/stats', requireAuth());
 
 // ─── Mount Route Modules ─────────────────────────────────────
+// IMPORTANT: features and efile mount BEFORE returns so static
+// paths like /supported-years, /compare, /tax-calendar, /batch-calculate
+// don't get swallowed by returns' /:id catch-all route.
 app.route('/clients', clients);
+app.route('/returns', features);
+app.route('/returns', efile);
 app.route('/returns', returns);
 app.route('/documents', documents);
 app.route('/billing', billing);
-app.route('/returns', efile);
-app.route('/returns', features);
 
 // ─── Tax Calculation Endpoints ───────────────────────────────
 app.post('/returns/:id/calculate', requireAuth(), async (c) => {
