@@ -56,9 +56,9 @@ app.get('/health', async (c) => {
   return c.json({
     status: 'healthy',
     service: 'echo-tax-return',
-    version: '3.1.0',
+    version: '3.2.0',
     timestamp: new Date().toISOString(),
-    features: ['multi-year', 'what-if', 'audit-risk', 'amendments', 'penalty-calc', 'notes', 'engagement-letter', 'export', 'income-projector', 'tax-calendar', 'tax-tips', 'withholding-estimator', 'batch-calculate', 'return-diff', 'document-checklist', 'bracket-analysis', 'return-locking', 'client-portal', 'deduction-maximizer', 'client-summary', 'return-timeline', 'tax-knowledge-search', 'return-snapshot', 'return-validation', 'preparer-dashboard', 'audit-logging', 'se-tax-calculator', 'safe-harbor-analysis', 'print-package', 'income-analysis', 'key-numbers-reference', 'communications-log'],
+    features: ['multi-year', 'what-if', 'audit-risk', 'amendments', 'penalty-calc', 'notes', 'engagement-letter', 'export', 'income-projector', 'tax-calendar', 'tax-tips', 'withholding-estimator', 'batch-calculate', 'return-diff', 'document-checklist', 'bracket-analysis', 'return-locking', 'client-portal', 'deduction-maximizer', 'client-summary', 'return-timeline', 'tax-knowledge-search', 'return-snapshot', 'return-validation', 'preparer-dashboard', 'audit-logging', 'se-tax-calculator', 'safe-harbor-analysis', 'print-package', 'income-analysis', 'key-numbers-reference', 'communications-log', 'state-tax-estimate', 'required-forms', 'depreciation-calculator', 'tax-strategy-planner', 'trend-analysis'],
     database: dbCheck ? 'connected' : 'error',
     clients: dbCheck?.cnt || 0,
   });
@@ -85,7 +85,7 @@ app.get('/pricing', async (c) => {
 app.get('/docs', (c) => {
   return c.json({
     service: 'echo-tax-return',
-    version: '3.1.0',
+    version: '3.2.0',
     preparer: 'Bobby Don McWilliams II',
     base_url: 'https://echo-tax-return.bmcii1976.workers.dev',
     auth: { header: 'X-Echo-API-Key', alt: 'Authorization: Bearer <key>' },
@@ -193,6 +193,11 @@ app.get('/docs', (c) => {
         { method: 'GET', path: '/returns/:id/safe-harbor', description: 'IRS safe harbor analysis (90%/100%/110% thresholds, penalty risk)' },
         { method: 'GET', path: '/returns/:id/print-package', description: 'Comprehensive print-ready return summary' },
         { method: 'GET', path: '/returns/:id/income-analysis', description: 'Income source diversification & concentration risk' },
+        { method: 'GET', path: '/returns/:id/state-tax?state=XX', description: 'State income tax estimate with SALT analysis & relocation savings' },
+        { method: 'GET', path: '/returns/:id/required-forms', description: 'Required IRS forms based on return data' },
+        { method: 'POST', path: '/returns/:id/depreciation', description: 'MACRS depreciation calculator with Section 179 & bonus analysis' },
+        { method: 'GET', path: '/returns/:id/strategy', description: 'Personalized tax strategy planner with savings estimates' },
+        { method: 'GET', path: '/returns/:id/trend', description: 'Year-over-year trend analysis with income projections' },
       ],
       admin: [
         { method: 'GET', path: '/stats', description: 'Dashboard stats (Commander only)' },

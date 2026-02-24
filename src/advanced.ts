@@ -405,4 +405,492 @@ advanced.get('/:id/income-analysis', async (c) => {
   });
 });
 
+// ─── State Tax Estimate ──────────────────────────────────────
+advanced.get('/:id/state-tax', async (c) => {
+  const returnId = c.req.param('id');
+  const ret = await c.env.DB.prepare('SELECT * FROM returns WHERE id = ?').bind(returnId).first<TaxReturn>();
+  if (!ret) return c.json({ error: 'Return not found' }, 404);
+
+  const client = await c.env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(ret.client_id).first<Client>();
+  const state = (c.req.query('state') || client?.address_state || 'TX').toUpperCase();
+
+  // State income tax rates (simplified — top marginal rates for most common states)
+  const stateTaxRates: Record<string, { rate: number; type: string; notes: string; brackets?: { rate: number; up_to: number }[] }> = {
+    TX: { rate: 0, type: 'none', notes: 'Texas has no state income tax' },
+    FL: { rate: 0, type: 'none', notes: 'Florida has no state income tax' },
+    NV: { rate: 0, type: 'none', notes: 'Nevada has no state income tax' },
+    WA: { rate: 0, type: 'none', notes: 'Washington has no state income tax (7% capital gains tax applies)' },
+    WY: { rate: 0, type: 'none', notes: 'Wyoming has no state income tax' },
+    AK: { rate: 0, type: 'none', notes: 'Alaska has no state income tax' },
+    SD: { rate: 0, type: 'none', notes: 'South Dakota has no state income tax' },
+    TN: { rate: 0, type: 'none', notes: 'Tennessee has no state income tax' },
+    NH: { rate: 0, type: 'none', notes: 'New Hampshire taxes only interest/dividends (being phased out)' },
+    CA: { rate: 13.3, type: 'graduated', notes: 'Highest state tax in US', brackets: [
+      { rate: 1, up_to: 10412 }, { rate: 2, up_to: 24684 }, { rate: 4, up_to: 38959 },
+      { rate: 6, up_to: 54081 }, { rate: 8, up_to: 68350 }, { rate: 9.3, up_to: 349137 },
+      { rate: 10.3, up_to: 418961 }, { rate: 11.3, up_to: 698271 }, { rate: 12.3, up_to: 1000000 },
+      { rate: 13.3, up_to: Infinity },
+    ]},
+    NY: { rate: 10.9, type: 'graduated', notes: 'Plus NYC tax if applicable (3.876%)', brackets: [
+      { rate: 4, up_to: 8500 }, { rate: 4.5, up_to: 11700 }, { rate: 5.25, up_to: 13900 },
+      { rate: 5.85, up_to: 80650 }, { rate: 6.25, up_to: 215400 }, { rate: 6.85, up_to: 1077550 },
+      { rate: 9.65, up_to: 5000000 }, { rate: 10.3, up_to: 25000000 }, { rate: 10.9, up_to: Infinity },
+    ]},
+    NJ: { rate: 10.75, type: 'graduated', notes: 'High rate for $1M+ income' },
+    IL: { rate: 4.95, type: 'flat', notes: 'Flat rate on all income' },
+    PA: { rate: 3.07, type: 'flat', notes: 'Flat rate, one of the lowest' },
+    MA: { rate: 5, type: 'flat', notes: 'Flat rate + 4% surtax on income over $1M' },
+    NM: { rate: 5.9, type: 'graduated', notes: 'Graduated rates' },
+    OK: { rate: 4.75, type: 'graduated', notes: 'Graduated rates' },
+    CO: { rate: 4.4, type: 'flat', notes: 'Flat rate' },
+    AZ: { rate: 2.5, type: 'flat', notes: 'Flat rate' },
+    LA: { rate: 4.25, type: 'graduated', notes: 'Graduated rates' },
+  };
+
+  const stateInfo = stateTaxRates[state] || { rate: 5, type: 'graduated', notes: 'Estimated — check state-specific rates' };
+  const taxableIncome = ret.taxable_income || 0;
+  let stateTax = 0;
+
+  if (stateInfo.brackets) {
+    let remaining = taxableIncome;
+    let prevMax = 0;
+    for (const bracket of stateInfo.brackets) {
+      const bracketAmount = Math.min(remaining, bracket.up_to - prevMax);
+      if (bracketAmount > 0) {
+        stateTax += bracketAmount * (bracket.rate / 100);
+        remaining -= bracketAmount;
+      }
+      prevMax = bracket.up_to;
+      if (remaining <= 0) break;
+    }
+  } else if (stateInfo.type === 'flat') {
+    stateTax = taxableIncome * (stateInfo.rate / 100);
+  }
+
+  stateTax = Math.round(stateTax * 100) / 100;
+
+  return c.json({
+    return_id: returnId,
+    tax_year: ret.tax_year,
+    state,
+    state_tax_info: {
+      type: stateInfo.type,
+      top_rate: stateInfo.rate + '%',
+      notes: stateInfo.notes,
+    },
+    calculation: {
+      federal_taxable_income: taxableIncome,
+      state_adjustments: 0,
+      state_taxable_income: taxableIncome,
+      estimated_state_tax: stateTax,
+      effective_state_rate: taxableIncome > 0 ? Math.round((stateTax / taxableIncome) * 10000) / 100 + '%' : '0%',
+    },
+    combined_tax_burden: {
+      federal_tax: ret.total_tax,
+      state_tax: stateTax,
+      total_combined: Math.round((ret.total_tax + stateTax) * 100) / 100,
+      combined_effective_rate: ret.total_income > 0
+        ? Math.round(((ret.total_tax + stateTax) / ret.total_income) * 10000) / 100 + '%'
+        : '0%',
+    },
+    salt_deduction: {
+      state_income_tax: stateTax,
+      property_tax_estimate: 0,
+      total_salt: stateTax,
+      salt_cap: 10000,
+      deductible: Math.min(stateTax, 10000),
+      over_cap: stateTax > 10000 ? Math.round((stateTax - 10000) * 100) / 100 : 0,
+    },
+    no_income_tax_states: ['TX', 'FL', 'NV', 'WA', 'WY', 'AK', 'SD', 'TN', 'NH'],
+    relocation_savings: stateInfo.rate > 0 ? {
+      annual_state_tax_savings: stateTax,
+      five_year_savings: Math.round(stateTax * 5 * 100) / 100,
+      note: 'Savings from relocating to a no-income-tax state. Does not account for cost-of-living differences.',
+    } : null,
+  });
+});
+
+// ─── IRS Form Library ────────────────────────────────────────
+advanced.get('/:id/required-forms', async (c) => {
+  const returnId = c.req.param('id');
+  const ret = await c.env.DB.prepare('SELECT * FROM returns WHERE id = ?').bind(returnId).first<TaxReturn>();
+  if (!ret) return c.json({ error: 'Return not found' }, 404);
+
+  const income = await c.env.DB.prepare('SELECT * FROM income_items WHERE return_id = ?').bind(returnId).all<IncomeItem>();
+  const deductions = await c.env.DB.prepare('SELECT * FROM deductions WHERE return_id = ?').bind(returnId).all<Deduction>();
+  const dependents = await c.env.DB.prepare('SELECT * FROM dependents WHERE return_id = ?').bind(returnId).all<Dependent>();
+
+  const categories = new Set(income.results.map(i => i.category));
+  const schedules = new Set(deductions.results.map(d => d.schedule).filter(Boolean));
+  const forms: { form: string; name: string; reason: string; required: boolean }[] = [];
+
+  // Always required
+  forms.push({ form: '1040', name: 'U.S. Individual Income Tax Return', reason: 'Primary federal tax return', required: true });
+
+  // Income-based
+  if (categories.has('wages')) forms.push({ form: 'W-2', name: 'Wage and Tax Statement', reason: 'Employment income reported', required: true });
+  if (categories.has('interest')) forms.push({ form: '1099-INT', name: 'Interest Income', reason: 'Interest income reported', required: true });
+  if (categories.has('dividends')) forms.push({ form: '1099-DIV', name: 'Dividends and Distributions', reason: 'Dividend income reported', required: true });
+  if (categories.has('business') || categories.has('self_employment') || categories.has('freelance')) {
+    forms.push({ form: 'Schedule C', name: 'Profit or Loss from Business', reason: 'Self-employment/business income', required: true });
+    forms.push({ form: 'Schedule SE', name: 'Self-Employment Tax', reason: 'SE tax calculation', required: true });
+    forms.push({ form: '1099-NEC', name: 'Nonemployee Compensation', reason: 'Freelance/contract income', required: true });
+  }
+  if (categories.has('capital_gains')) {
+    forms.push({ form: 'Schedule D', name: 'Capital Gains and Losses', reason: 'Investment transactions', required: true });
+    forms.push({ form: '8949', name: 'Sales and Dispositions of Capital Assets', reason: 'Detail of each transaction', required: true });
+    forms.push({ form: '1099-B', name: 'Proceeds from Broker Transactions', reason: 'Brokerage sales reported', required: true });
+  }
+  if (categories.has('rental')) {
+    forms.push({ form: 'Schedule E', name: 'Supplemental Income and Loss', reason: 'Rental property income', required: true });
+  }
+  if (categories.has('retirement')) {
+    forms.push({ form: '1099-R', name: 'Distributions from Pensions, Annuities, Retirement', reason: 'Retirement distributions', required: true });
+  }
+  if (categories.has('other') || categories.has('gambling')) {
+    forms.push({ form: 'W-2G', name: 'Certain Gambling Winnings', reason: 'Gambling income reported', required: true });
+  }
+
+  // Deduction-based
+  if (ret.deduction_method === 'itemized' || schedules.has('A')) {
+    forms.push({ form: 'Schedule A', name: 'Itemized Deductions', reason: 'Itemized deductions claimed', required: true });
+  }
+  if (schedules.has('C')) forms.push({ form: 'Schedule C', name: 'Profit or Loss from Business', reason: 'Business expenses', required: true });
+
+  // Dependent-based
+  if (dependents.results.length > 0) {
+    forms.push({ form: 'Schedule 8812', name: 'Credits for Qualifying Children', reason: `${dependents.results.length} dependent(s) claimed`, required: true });
+  }
+
+  // Common additional forms
+  const totalIncome = ret.total_income || 0;
+  if (totalIncome > 100000 || income.results.length > 3) {
+    forms.push({ form: 'Schedule 1', name: 'Additional Income and Adjustments', reason: 'Additional income items or adjustments', required: true });
+  }
+  if ((ret.total_tax || 0) > 1000 && (ret.total_payments || 0) < (ret.total_tax || 0) * 0.9) {
+    forms.push({ form: '2210', name: 'Underpayment of Estimated Tax', reason: 'Potential underpayment penalty', required: false });
+  }
+  forms.push({ form: 'Schedule 2', name: 'Additional Taxes', reason: 'AMT, SE tax, early distribution penalty', required: false });
+  forms.push({ form: 'Schedule 3', name: 'Additional Credits and Payments', reason: 'Education credits, estimated tax payments', required: false });
+
+  // Deduplicate
+  const seen = new Set<string>();
+  const uniqueForms = forms.filter(f => { if (seen.has(f.form)) return false; seen.add(f.form); return true; });
+
+  return c.json({
+    return_id: returnId,
+    tax_year: ret.tax_year,
+    forms_required: uniqueForms.filter(f => f.required).length,
+    forms_optional: uniqueForms.filter(f => !f.required).length,
+    forms: uniqueForms,
+    filing_status: ret.deduction_method || 'standard',
+    income_categories: [...categories],
+    schedules_needed: [...schedules],
+  });
+});
+
+// ─── Depreciation Calculator ─────────────────────────────────
+advanced.post('/:id/depreciation', async (c) => {
+  const returnId = c.req.param('id');
+  const ret = await c.env.DB.prepare('SELECT * FROM returns WHERE id = ?').bind(returnId).first<TaxReturn>();
+  if (!ret) return c.json({ error: 'Return not found' }, 404);
+
+  const body = await c.req.json<{
+    asset_name: string; cost_basis: number; placed_in_service: string;
+    asset_class: string; method?: string; salvage_value?: number;
+  }>();
+
+  if (!body.asset_name || !body.cost_basis || !body.asset_class) {
+    return c.json({ error: 'asset_name, cost_basis, and asset_class required' }, 400);
+  }
+
+  // MACRS useful life by asset class
+  const macrsYears: Record<string, number> = {
+    '3-year': 3, '5-year': 5, '7-year': 7, '10-year': 10, '15-year': 15,
+    '20-year': 20, '27.5-year': 27, '39-year': 39,
+    vehicles: 5, computers: 5, furniture: 7, equipment: 7,
+    machinery: 7, buildings_residential: 27, buildings_commercial: 39,
+    improvements: 15, land_improvements: 15,
+  };
+
+  const usefulLife = macrsYears[body.asset_class] || 7;
+  const method = body.method || (usefulLife <= 20 ? 'double_declining' : 'straight_line');
+  const costBasis = body.cost_basis;
+  const salvage = body.salvage_value || 0;
+  const depreciable = costBasis - salvage;
+
+  const schedule: { year: number; depreciation: number; cumulative: number; book_value: number }[] = [];
+  let cumulative = 0;
+
+  if (method === 'straight_line') {
+    const annual = Math.round((depreciable / usefulLife) * 100) / 100;
+    for (let y = 1; y <= usefulLife; y++) {
+      const dep = Math.min(annual, depreciable - cumulative);
+      cumulative += dep;
+      schedule.push({ year: y, depreciation: Math.round(dep * 100) / 100, cumulative: Math.round(cumulative * 100) / 100, book_value: Math.round((costBasis - cumulative) * 100) / 100 });
+    }
+  } else {
+    const ddbRate = 2 / usefulLife;
+    let bookValue = costBasis;
+    for (let y = 1; y <= usefulLife; y++) {
+      let dep = Math.round(bookValue * ddbRate * 100) / 100;
+      const slRemaining = Math.round((bookValue - salvage) / (usefulLife - y + 1) * 100) / 100;
+      if (slRemaining > dep) dep = slRemaining; // Switch to SL when beneficial
+      dep = Math.min(dep, bookValue - salvage);
+      if (dep < 0) dep = 0;
+      cumulative += dep;
+      bookValue -= dep;
+      schedule.push({ year: y, depreciation: dep, cumulative: Math.round(cumulative * 100) / 100, book_value: Math.round(bookValue * 100) / 100 });
+    }
+  }
+
+  // Section 179 analysis
+  const section179Limit = ret.tax_year >= 2025 ? 1250000 : ret.tax_year >= 2024 ? 1220000 : 1160000;
+  const section179Eligible = costBasis <= section179Limit;
+
+  // Bonus depreciation (100% for assets placed before 2023, phasing down)
+  const bonusPct = ret.tax_year <= 2022 ? 100 : ret.tax_year === 2023 ? 80 : ret.tax_year === 2024 ? 60 : ret.tax_year === 2025 ? 40 : 20;
+
+  return c.json({
+    return_id: returnId,
+    tax_year: ret.tax_year,
+    asset: {
+      name: body.asset_name,
+      cost_basis: costBasis,
+      salvage_value: salvage,
+      depreciable_amount: depreciable,
+      asset_class: body.asset_class,
+      useful_life_years: usefulLife,
+      method: method === 'straight_line' ? 'Straight-Line' : 'Double Declining Balance (MACRS)',
+    },
+    depreciation_schedule: schedule,
+    first_year_deduction: schedule[0]?.depreciation || 0,
+    total_depreciation: Math.round(cumulative * 100) / 100,
+    accelerated_options: {
+      section_179: {
+        eligible: section179Eligible,
+        max_deduction: section179Limit,
+        immediate_deduction: section179Eligible ? costBasis : 0,
+        tax_savings_estimate: section179Eligible ? Math.round(costBasis * 0.22 * 100) / 100 : 0,
+      },
+      bonus_depreciation: {
+        rate: bonusPct + '%',
+        deduction: Math.round(depreciable * (bonusPct / 100) * 100) / 100,
+        tax_savings_estimate: Math.round(depreciable * (bonusPct / 100) * 0.22 * 100) / 100,
+        note: bonusPct < 100 ? `Bonus depreciation is ${bonusPct}% for ${ret.tax_year} (phasing down from 100% in 2022)` : 'Full 100% bonus depreciation available',
+      },
+    },
+    recommendations: [
+      section179Eligible ? 'Section 179 allows full immediate deduction — strongest first-year benefit' : null,
+      bonusPct > 0 ? `Bonus depreciation at ${bonusPct}% available as alternative to Section 179` : null,
+      usefulLife > 20 ? 'Real property — must use straight-line depreciation (no bonus depreciation on structures)' : null,
+      body.asset_class === 'vehicles' ? 'Vehicle depreciation limits apply (luxury auto limits). Consider Section 179 for SUVs over 6,000 lbs GVW.' : null,
+    ].filter(Boolean),
+  });
+});
+
+// ─── Tax Strategy Planner ────────────────────────────────────
+advanced.get('/:id/strategy', async (c) => {
+  const returnId = c.req.param('id');
+  const ret = await c.env.DB.prepare('SELECT * FROM returns WHERE id = ?').bind(returnId).first<TaxReturn>();
+  if (!ret) return c.json({ error: 'Return not found' }, 404);
+
+  const client = await c.env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(ret.client_id).first<Client>();
+  const income = await c.env.DB.prepare('SELECT * FROM income_items WHERE return_id = ?').bind(returnId).all<IncomeItem>();
+  const deductions = await c.env.DB.prepare('SELECT * FROM deductions WHERE return_id = ?').bind(returnId).all<Deduction>();
+  const dependents = await c.env.DB.prepare('SELECT * FROM dependents WHERE return_id = ?').bind(returnId).all<Dependent>();
+
+  const agi = ret.adjusted_gross_income || 0;
+  const taxableIncome = ret.taxable_income || 0;
+  const totalTax = ret.total_tax || 0;
+  const effectiveRate = agi > 0 ? Math.round((totalTax / agi) * 10000) / 100 : 0;
+  const filingStatus = client?.filing_status || 'single';
+
+  const strategies: { strategy: string; category: string; potential_savings: number; complexity: string; description: string; action_items: string[] }[] = [];
+
+  // Retirement contribution strategy
+  const has401k = income.results.some(i => i.category === 'wages');
+  if (has401k) {
+    const maxContrib = ret.tax_year >= 2025 ? 23500 : 23000;
+    const savings = Math.round(maxContrib * (effectiveRate / 100) * 100) / 100;
+    strategies.push({
+      strategy: 'Maximize 401(k) Contributions',
+      category: 'retirement',
+      potential_savings: savings,
+      complexity: 'Low',
+      description: `Max out 401(k) at $${maxContrib.toLocaleString()} to reduce taxable income`,
+      action_items: ['Contact HR to increase 401(k) contribution', 'Set up automatic increases', 'Consider catch-up contributions if 50+'],
+    });
+  }
+
+  // IRA contribution
+  const iraLimit = ret.tax_year >= 2024 ? 7000 : 6500;
+  const iraSavings = Math.round(iraLimit * (effectiveRate / 100) * 100) / 100;
+  strategies.push({
+    strategy: 'Traditional IRA Contribution',
+    category: 'retirement',
+    potential_savings: iraSavings,
+    complexity: 'Low',
+    description: `Contribute $${iraLimit.toLocaleString()} to Traditional IRA for tax deduction`,
+    action_items: ['Open IRA if not already established', 'Fund by April 15 deadline', 'Check MAGI limits for deductibility'],
+  });
+
+  // HSA strategy
+  const hsaLimit = ret.tax_year >= 2025 ? 4300 : 4150;
+  const hsaSavings = Math.round(hsaLimit * (effectiveRate / 100) * 100) / 100;
+  strategies.push({
+    strategy: 'HSA Contribution (if HDHP enrolled)',
+    category: 'health',
+    potential_savings: hsaSavings,
+    complexity: 'Low',
+    description: 'Triple tax benefit — deductible, grows tax-free, tax-free withdrawals for medical',
+    action_items: ['Verify HDHP enrollment', 'Max out HSA contributions', 'Consider investing HSA funds for growth'],
+  });
+
+  // Charitable giving
+  if (agi > 100000) {
+    const charitableTarget = Math.round(agi * 0.05);
+    const charSavings = Math.round(charitableTarget * (effectiveRate / 100) * 100) / 100;
+    strategies.push({
+      strategy: 'Charitable Giving Strategy',
+      category: 'deductions',
+      potential_savings: charSavings,
+      complexity: 'Medium',
+      description: 'Bundle charitable donations or use Donor Advised Fund for deduction timing',
+      action_items: ['Consider Donor Advised Fund for bunching', 'Donate appreciated stock to avoid capital gains', 'Track all cash and non-cash donations'],
+    });
+  }
+
+  // Tax-loss harvesting
+  if (income.results.some(i => i.category === 'capital_gains')) {
+    strategies.push({
+      strategy: 'Tax-Loss Harvesting',
+      category: 'investments',
+      potential_savings: Math.min(3000, taxableIncome * 0.01),
+      complexity: 'Medium',
+      description: 'Sell losing investments to offset capital gains (up to $3,000 against ordinary income)',
+      action_items: ['Review portfolio for unrealized losses', 'Harvest losses before year-end', 'Mind wash sale rule (30 days)'],
+    });
+  }
+
+  // Business entity strategy
+  if (income.results.some(i => ['business', 'self_employment', 'freelance'].includes(i.category))) {
+    const seIncome = income.results.filter(i => ['business', 'self_employment', 'freelance'].includes(i.category)).reduce((s, i) => s + i.amount, 0);
+    if (seIncome > 50000) {
+      strategies.push({
+        strategy: 'S-Corp Election',
+        category: 'entity',
+        potential_savings: Math.round(seIncome * 0.0765 * 0.4 * 100) / 100,
+        complexity: 'High',
+        description: 'Elect S-Corp status to split income between salary and distributions, reducing SE tax',
+        action_items: ['File Form 2553 (S-Corp election)', 'Set reasonable salary (60-70% of income)', 'Run payroll monthly or quarterly', 'File Form 1120-S annually'],
+      });
+    }
+  }
+
+  // Dependent strategies
+  if (dependents.results.length > 0) {
+    strategies.push({
+      strategy: 'Dependent Care Benefits',
+      category: 'credits',
+      potential_savings: Math.min(dependents.results.length * 2000, 6000),
+      complexity: 'Low',
+      description: 'Maximize Child Tax Credit and Dependent Care FSA',
+      action_items: ['Enroll in employer Dependent Care FSA ($5,000 max)', 'Claim all eligible dependents', 'Check eligibility for Child and Dependent Care Credit'],
+    });
+  }
+
+  // SALT optimization
+  if (filingStatus === 'married_joint' && agi > 200000) {
+    strategies.push({
+      strategy: 'SALT Cap Workaround (PTE Tax)',
+      category: 'deductions',
+      potential_savings: Math.round(Math.max(0, (agi * 0.05) - 10000) * (effectiveRate / 100) * 100) / 100,
+      complexity: 'High',
+      description: 'Pass-through entity tax election to bypass $10K SALT deduction cap',
+      action_items: ['Check if state offers PTE election', 'Evaluate with tax professional', 'File election by state deadline'],
+    });
+  }
+
+  strategies.sort((a, b) => b.potential_savings - a.potential_savings);
+
+  return c.json({
+    return_id: returnId,
+    tax_year: ret.tax_year,
+    current_position: {
+      agi,
+      taxable_income: taxableIncome,
+      total_tax: totalTax,
+      effective_rate: effectiveRate + '%',
+      filing_status: filingStatus,
+      dependents: dependents.results.length,
+    },
+    strategies,
+    total_potential_savings: Math.round(strategies.reduce((s, st) => s + st.potential_savings, 0) * 100) / 100,
+    top_3_actions: strategies.slice(0, 3).map(s => s.action_items[0]),
+    disclaimer: 'Tax strategies should be reviewed with a qualified tax professional. Savings estimates are approximate and depend on individual circumstances.',
+  });
+});
+
+// ─── Year-Over-Year Trend Analysis ───────────────────────────
+advanced.get('/:id/trend', async (c) => {
+  const returnId = c.req.param('id');
+  const ret = await c.env.DB.prepare('SELECT * FROM returns WHERE id = ?').bind(returnId).first<TaxReturn>();
+  if (!ret) return c.json({ error: 'Return not found' }, 404);
+
+  const allReturns = await c.env.DB.prepare(
+    'SELECT * FROM returns WHERE client_id = ? ORDER BY tax_year ASC'
+  ).bind(ret.client_id).all<TaxReturn>();
+
+  const years = allReturns.results;
+  if (years.length < 2) return c.json({ return_id: returnId, message: 'Need at least 2 years of returns for trend analysis', years_available: years.length });
+
+  const trends = years.map((r, i) => {
+    const prev = i > 0 ? years[i - 1] : null;
+    return {
+      tax_year: r.tax_year,
+      total_income: r.total_income,
+      income_change: prev ? Math.round((r.total_income - prev.total_income) * 100) / 100 : 0,
+      income_change_pct: prev && prev.total_income > 0 ? Math.round(((r.total_income - prev.total_income) / prev.total_income) * 10000) / 100 : 0,
+      agi: r.adjusted_gross_income,
+      taxable_income: r.taxable_income,
+      total_tax: r.total_tax,
+      tax_change: prev ? Math.round((r.total_tax - prev.total_tax) * 100) / 100 : 0,
+      effective_rate: r.total_income > 0 ? Math.round((r.total_tax / r.total_income) * 10000) / 100 : 0,
+      refund_or_owed: r.refund_or_owed,
+      deduction_method: r.deduction_method,
+    };
+  });
+
+  const avgIncome = Math.round(years.reduce((s, r) => s + r.total_income, 0) / years.length);
+  const avgTax = Math.round(years.reduce((s, r) => s + r.total_tax, 0) / years.length * 100) / 100;
+  const incomeGrowth = years.length >= 2
+    ? Math.round(((years[years.length - 1].total_income - years[0].total_income) / years[0].total_income) * 10000) / 100
+    : 0;
+
+  return c.json({
+    return_id: returnId,
+    client_id: ret.client_id,
+    years_analyzed: years.length,
+    year_range: `${years[0].tax_year}-${years[years.length - 1].tax_year}`,
+    trends,
+    summary: {
+      average_income: avgIncome,
+      average_tax: avgTax,
+      income_growth_total: incomeGrowth + '%',
+      income_growth_annual: Math.round(incomeGrowth / Math.max(years.length - 1, 1) * 100) / 100 + '%',
+      highest_income_year: years.reduce((max, r) => r.total_income > max.total_income ? r : max).tax_year,
+      lowest_tax_rate_year: years.filter(r => r.total_income > 0).reduce((min, r) => {
+        const rate = r.total_tax / r.total_income;
+        const minRate = min.total_tax / (min.total_income || 1);
+        return rate < minRate ? r : min;
+      }).tax_year,
+    },
+    projections: {
+      next_year_income_estimate: Math.round(years[years.length - 1].total_income * (1 + incomeGrowth / 100 / Math.max(years.length - 1, 1))),
+      note: 'Projection based on historical growth rate — actual results may vary',
+    },
+  });
+});
+
 export default advanced;
